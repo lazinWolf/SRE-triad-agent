@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sre-triage"
+version = "0.1.0"
+description = "Multi-agent SRE incident triage for the OpenTelemetry Demo, built on Google ADK"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "docker>=7.2.0",
+    "google-adk>=2.11.0",
+    "httpx>=0.28.1",
+    "litellm>=1.104.2",
+    "pydantic>=2.14.0",
+    "python-dotenv>=1.2.4",
+    "streamlit>=1.65.0",
+]
+
+[project.scripts]
+sre-triage = "sre_triage.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sre_triage"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+testpaths = ["tests"]

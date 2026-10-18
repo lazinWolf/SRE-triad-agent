@@ -1,0 +1,34 @@
+# Runs the triage worker and dashboard in containers next to the OpenTelemetry Demo.
+# Start the demo first:   infra/sre/demo.sh up
+# Then:                   docker compose up --build -d     ->  http://localhost:8501
+x-triage: &triage
+  build: .
+  env_file: .env
+  environment:
+    SRE_PROMETHEUS_URL: http://prometheus:9090
+    SRE_JAEGER_URL: http://jaeger:16686/jaeger/ui
+    SRE_OPENSEARCH_URL: http://opensearch:9200
+    SRE_DOCKER_URL: unix:///var/run/docker.sock
+    SRE_DEMO_DIR: /demo
+    SRE_DATA_DIR: /data
+  volumes:
+    - ./data:/data
+    - /var/run/docker.sock:/var/run/docker.sock
+    # flagd watches this directory; remediation and fault injection edit its flag file.
+    - ./infra/otel-demo/src/flagd:/demo/src/flagd
+  networks: [opentelemetry-demo]
+  restart: unless-stopped
+
+services:
+  triage-worker:
+    <<: *triage
+    command: ["sre-triage", "worker"]
+  triage-ui:
+    <<: *triage
+    command: ["streamlit", "run", "src/sre_triage/ui/app.py", "--server.address=0.0.0.0", "--server.port=8501",
+              "--server.headless=true", "--browser.gatherUsageStats=false"]
+    ports: ["127.0.0.1:8501:8501"]
+
+networks:
+  opentelemetry-demo:
+    external: true

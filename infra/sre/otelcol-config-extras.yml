@@ -1,0 +1,21 @@
+# SRE triage collector additions (loaded last, so maps here merge over earlier layers).
+# Adds container CPU-limit and throttling metrics so resource faults are observable,
+# and flushes span metrics often enough for minute-scale incident windows.
+receivers:
+  docker_stats:
+    collection_interval: 10s
+    metrics:
+      container.cpu.limit:
+        enabled: true
+      container.cpu.throttling_data.periods:
+        enabled: true
+      container.cpu.throttling_data.throttled_periods:
+        enabled: true
+      container.cpu.throttling_data.throttled_time:
+        enabled: true
+      container.restarts:
+        enabled: true
+
+connectors:
+  span_metrics:
+    metrics_flush_interval: 15s

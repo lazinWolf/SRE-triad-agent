@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Incident investigation</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to investigation</a>
+    <header class="app-header">
+      <a class="wordmark" href="/" aria-label="Incident investigation home">
+        <span class="wordmark-icon" aria-hidden="true">↗</span>
+        <span>Incident investigation</span>
+      </a>
+      <div class="header-meta">
+        <span class="stage-label">Stage 1 · Local prototype</span>
+        <span id="connection-status" class="status-badge neutral" role="status">Connecting</span>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <div class="intro">
+        <div>
+          <p class="eyebrow">SRE investigation workspace</p>
+          <h1>From symptoms to evidence.</h1>
+          <p class="intro-copy">Investigate a checkout incident, inspect the evidence, and guide the next step.</p>
+        </div>
+        <div class="runtime-card" aria-label="Runtime configuration">
+          <span class="runtime-label">Investigation runtime</span>
+          <strong id="runtime-label">Loading configuration…</strong>
+          <span id="runtime-detail">Checking the local API.</span>
+        </div>
+      </div>
+
+      <div id="global-message" class="notice" role="status" hidden></div>
+
+      <div class="workspace-grid">
+        <aside class="sidebar" aria-label="Incident cases">
+          <section class="panel intake-panel">
+            <div class="section-heading">
+              <h2>Start a case</h2>
+              <span class="subtle-tag">Local checkout</span>
+            </div>
+            <form id="case-form">
+              <label for="case-summary">What are you observing?</label>
+              <textarea id="case-summary" name="summary" rows="3" required minlength="3" maxlength="2000" placeholder="Checkout requests are slow or timing out."></textarea>
+              <div class="field-pair">
+                <div>
+                  <label for="case-start">From</label>
+                  <input id="case-start" name="start" type="datetime-local" required step="0.001">
+                </div>
+                <div>
+                  <label for="case-end">To</label>
+                  <input id="case-end" name="end" type="datetime-local" required step="0.001">
+                </div>
+              </div>
+              <p class="field-help">Up to one hour. Times use your browser’s local timezone.</p>
+              <label for="case-onset">Symptom onset <span class="optional-label">optional</span></label>
+              <input id="case-onset" name="incident_start" type="datetime-local" step="0.001">
+              <p class="field-help">Within the window, when symptoms began. Helps compare before and after.</p>
+              <label for="case-mode">Investigation mode</label>
+              <select id="case-mode" name="mode">
+                <option value="live">Live model investigation</option>
+                <option value="replay">Scripted ADK replay</option>
+              </select>
+              <p id="mode-help" class="field-help">The model chooses queries and follow-up investigations.</p>
+              <button class="button primary full-width" id="create-case" type="submit">Create case</button>
+              <button class="button text full-width" id="load-demo-alert" type="button">Use latest demo alert</button>
+            </form>
+            <p class="intake-note">Generate traffic and faults with the demo CLI, then load its alert here.</p>
+          </section>
+
+          <section class="panel case-panel">
+            <div class="section-heading">
+              <h2>Cases</h2>
+              <button id="refresh-cases" class="icon-button" type="button" aria-label="Refresh cases" title="Refresh cases">↻</button>
+            </div>
+            <div id="case-list" class="case-list">
+              <p class="empty-note">Loading cases…</p>
+            </div>
+          </section>
+
+          <section class="sidebar-note">
+            <span class="eyebrow">Operator control</span>
+            <p>Inspect findings before acting. This prototype recommends actions; operational changes are made separately.</p>
+          </section>
+        </aside>
+
+        <section id="workspace" class="panel investigation-panel" aria-label="Investigation" tabindex="-1">
+          <div id="welcome-view" class="welcome-view">
+            <div class="welcome-mark" aria-hidden="true">◎</div>
+            <p class="eyebrow">Your investigation starts here</p>
+            <h2>Give the agents a question.</h2>
+            <p>Create a case from an observed symptom, or select an existing case. Findings, tool evidence, and agent activity will appear here.</p>
+            <div class="welcome-steps">
+              <div><span>01</span><strong>Observe</strong><p>Define the symptom and time window.</p></div>
+              <div><span>02</span><strong>Investigate</strong><p>Agents gather and compare evidence.</p></div>
+              <div><span>03</span><strong>Review</strong><p>Correct findings and retain reviewed lessons.</p></div>
+            </div>
+          </div>
+
+          <div id="case-view" hidden>
+            <div class="case-header">
+              <div class="case-heading">
+                <p id="case-context" class="eyebrow">Checkout · Local</p>
+                <h2 id="case-title"></h2>
+                <p id="case-window" class="case-window"></p>
+              </div>
+              <div class="case-actions">
+                <span id="case-status" class="status-badge neutral"></span>
+                <button id="investigate-case" class="button primary" type="button">Investigate</button>
+              </div>
+            </div>
+            <div id="case-mode-banner" class="mode-banner" hidden></div>
+            <div id="case-error" class="notice error" role="alert" hidden></div>
+            <div class="investigation-stats" aria-label="Case totals">
+              <div><span id="evidence-count">0</span><p>Evidence records</p></div>
+              <div><span id="activity-count">0</span><p>Agent events</p></div>
+              <div><span id="feedback-count">0</span><p>Operator corrections</p></div>
+            </div>
+
+            <div class="tabs" role="tablist" aria-label="Investigation views">
+              <button id="tab-brief" role="tab" aria-selected="true" aria-controls="view-brief" tabindex="0" data-tab="brief">Findings</button>
+              <button id="tab-evidence" role="tab" aria-selected="false" aria-controls="view-evidence" tabindex="-1" data-tab="evidence">Evidence</button>
+              <button id="tab-activity" role="tab" aria-selected="false" aria-controls="view-activity" tabindex="-1" data-tab="activity">Activity</button>
+              <button id="tab-feedback" role="tab" aria-selected="false" aria-controls="view-feedback" tabindex="-1" data-tab="feedback">Feedback &amp; review</button>
+            </div>
+
+            <section id="view-brief" class="tab-panel" role="tabpanel" aria-labelledby="tab-brief" tabindex="0">
+              <div id="report-view"></div>
+            </section>
+            <section id="view-evidence" class="tab-panel" role="tabpanel" aria-labelledby="tab-evidence" tabindex="0" hidden>
+              <div class="view-heading"><h3>Evidence ledger</h3><p>Each record preserves the tool query, returned data, and collector.</p></div>
+              <div id="evidence-list"></div>
+            </section>
+            <section id="view-activity" class="tab-panel" role="tabpanel" aria-labelledby="tab-activity" tabindex="0" hidden>
+              <div class="view-heading"><h3>Investigation activity</h3><p>Follow delegation, queries, and changes in the investigation.</p></div>
+              <ol id="activity-list" class="timeline"></ol>
+            </section>
+            <section id="view-feedback" class="tab-panel" role="tabpanel" aria-labelledby="tab-feedback" tabindex="0" hidden>
+              <div class="view-heading"><h3>Guide the investigation</h3><p>Your correction becomes context for the next investigation run.</p></div>
+              <form id="feedback-form" class="feedback-form">
+                <label for="feedback-text">Correction or additional context</label>
+                <textarea id="feedback-text" rows="3" required minlength="3" maxlength="4000" placeholder="For example: that deployment affected staging only."></textarea>
+                <p class="field-help">Saving a correction clears the current report. Run the investigation again to incorporate it.</p>
+                <button id="save-feedback" class="button secondary" type="submit">Save correction</button>
+              </form>
+              <div id="feedback-list" class="feedback-list"></div>
+
+              <div class="review-section">
+                <h3>Retain a reviewed lesson</h3>
+                <p>Record what you have confirmed and the observed outcome. Outcomes are operator reported; this prototype does not verify recovery automatically.</p>
+                <form id="review-form">
+                  <label for="confirmed-cause">Confirmed cause</label>
+                  <input id="confirmed-cause" type="text" maxlength="2000" placeholder="Leave empty when the cause is still unknown.">
+                  <label for="review-outcome">Observed outcome</label>
+                  <select id="review-outcome">
+                    <option value="unresolved">Unresolved</option>
+                    <option value="mitigated">Mitigated — operator reports reduced impact</option>
+                    <option value="resolved">Resolved — operator reports recovery</option>
+                  </select>
+                  <label for="review-notes">Review notes</label>
+                  <textarea id="review-notes" rows="3" maxlength="4000" placeholder="What did you verify? What remains uncertain?"></textarea>
+                  <button id="save-review" class="button secondary" type="submit">Save reviewed memory</button>
+                </form>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel memory-panel" aria-label="Reviewed incident memory">
+        <div class="section-heading">
+          <div><p class="eyebrow">Lessons available to future cases</p><h2>Reviewed incident memory</h2></div>
+          <button id="refresh-memory" class="button text" type="button">Refresh</button>
+        </div>
+        <div id="memory-list" class="memory-list"><p class="empty-note">Loading reviewed incidents…</p></div>
+      </section>
+      <footer class="app-footer"><span>Google ADK · Multi-agent investigation</span><span>Evidence first. Operator reviewed.</span></footer>
+    </main>
+  </body>
+</html>

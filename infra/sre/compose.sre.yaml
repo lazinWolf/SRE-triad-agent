@@ -1,0 +1,49 @@
+# SRE triage overlay for the OpenTelemetry Demo.
+# Relative paths resolve from infra/otel-demo (the first compose file's directory).
+#
+# - Publishes telemetry backends on loopback so the triage agent tools can query them.
+# - Gives application containers an explicit CPU baseline, so a limit reduction is a
+#   visible configuration change and can be restored by an approved remediation.
+
+x-cpu-baseline: &cpu-baseline
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+
+services:
+  jaeger:
+    ports:
+      - "127.0.0.1:16686:16686"
+  opensearch:
+    ports:
+      - "127.0.0.1:9200:9200"
+    environment:
+      - OPENSEARCH_JAVA_OPTS=-Xms320m -Xmx320m
+  ad: *cpu-baseline
+  cart: *cpu-baseline
+  # Upstream caps these Go services at 20M with GOMEMLIMIT=16MiB, which makes the GC run
+  # continuously (~1 CPU each at idle) and gives a pathological "healthy" baseline.
+  checkout:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 80M
+    environment:
+      - GOMEMLIMIT=64MiB
+  currency: *cpu-baseline
+  email: *cpu-baseline
+  frontend: *cpu-baseline
+  payment: *cpu-baseline
+  product-catalog:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 80M
+    environment:
+      - GOMEMLIMIT=64MiB
+  quote: *cpu-baseline
+  recommendation: *cpu-baseline
+  shipping: *cpu-baseline

@@ -1,0 +1,72 @@
+[
+  {
+    "id": "seed_cart_cache_evictions",
+    "service": "cart",
+    "category": "cache_failure",
+    "title": "Cart latency from valkey memory pressure and key evictions",
+    "body": {
+      "symptom": "Checkout and add-to-cart latency rose; cart p95 above 800 ms",
+      "confirmed_cause": "valkey-cart reached its memory limit and evicted keys; cart fell back to slow reconstruction",
+      "outcome": "resolved",
+      "remediation": [{"action": "restart_service", "service": "valkey-cart"}],
+      "lessons": "Check valkey hit ratio, evictions and cart client span latency to valkey before blaming cart itself.",
+      "affected_services": ["cart", "checkout", "frontend"]
+    }
+  },
+  {
+    "id": "seed_payment_flag_misconfig",
+    "service": "payment",
+    "category": "dependency_errors",
+    "title": "Checkout failures after a payment feature flag was enabled",
+    "body": {
+      "symptom": "Checkout error ratio increased to roughly a third of orders",
+      "confirmed_cause": "A payment feature flag rollout made a share of charge requests fail",
+      "outcome": "resolved",
+      "remediation": [{"action": "set_feature_flag", "flag": "<payment flag>", "variant": "off"}],
+      "lessons": "Error traces terminated in payment Charge; flag change time matched error onset within a minute.",
+      "affected_services": ["payment", "checkout"]
+    }
+  },
+  {
+    "id": "seed_email_oom",
+    "service": "email",
+    "category": "memory_exhaustion",
+    "title": "Email service OOM restarts slowed order confirmation",
+    "body": {
+      "symptom": "Intermittent checkout latency spikes; email container restarting",
+      "confirmed_cause": "Memory growth in email until the container limit, then OOM kill and restart",
+      "outcome": "mitigated",
+      "remediation": [{"action": "restart_service", "service": "email"}],
+      "lessons": "Container events showed oom/die events; memory climbed steadily between restarts.",
+      "affected_services": ["email", "checkout"]
+    }
+  },
+  {
+    "id": "seed_currency_quota",
+    "service": "currency",
+    "category": "cpu_limit",
+    "title": "Currency CPU quota lowered during cost optimisation",
+    "body": {
+      "symptom": "Frontend and checkout latency increased; no errors",
+      "confirmed_cause": "Container CPU limit for currency reduced; requests queued behind CFS throttling",
+      "outcome": "resolved",
+      "remediation": [{"action": "set_cpu_limit", "service": "currency", "cpus": 1.0}],
+      "lessons": "Throttled-period ratio jumped while CPU utilisation sat at the new limit; restoring the limit recovered p95 within two minutes.",
+      "affected_services": ["currency", "checkout", "frontend"]
+    }
+  },
+  {
+    "id": "seed_catalog_lock",
+    "service": "product-catalog",
+    "category": "lock_contention",
+    "title": "Product catalog database lock contention",
+    "body": {
+      "symptom": "Product pages and checkout slow; product-catalog server latency high with low CPU",
+      "confirmed_cause": "Long-held locks in the catalog database serialised queries",
+      "outcome": "resolved",
+      "remediation": [],
+      "lessons": "Low CPU with high latency pointed away from saturation; trace self time sat in product-catalog database spans.",
+      "affected_services": ["product-catalog", "frontend", "checkout", "recommendation"]
+    }
+  }
+]
