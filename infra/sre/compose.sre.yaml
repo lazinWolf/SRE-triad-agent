@@ -12,6 +12,11 @@ x-cpu-baseline: &cpu-baseline
         cpus: "1.0"
 
 services:
+  # The shop is published on loopback port SRE_SHOP_PORT (default 8090) rather than the
+  # upstream 8080, which other local tools often hold. Inside the network it stays 8080.
+  frontend-proxy:
+    ports: !override
+      - "127.0.0.1:${SRE_SHOP_PORT:-8090}:${ENVOY_PORT}"
   jaeger:
     ports:
       - "127.0.0.1:16686:16686"

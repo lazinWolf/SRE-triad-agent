@@ -21,7 +21,8 @@ case "${1:-}" in
     # The collector's docker_stats receiver can miss containers that start while it
     # initialises; restarting it once everything runs gives complete container metrics.
     docker restart otel-collector >/dev/null
-    echo "Demo running: shop http://localhost:8080  Jaeger http://localhost:8080/jaeger/ui  Grafana http://localhost:8080/grafana"
+    port="${SRE_SHOP_PORT:-8090}"
+    echo "Demo running: shop http://localhost:$port  Jaeger http://localhost:16686/jaeger/ui  Grafana http://localhost:$port/grafana"
     ;;
   pull)  compose pull ;;
   down)  compose down --remove-orphans --volumes ;;

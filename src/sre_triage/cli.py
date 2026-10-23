@@ -1,270 +1,236 @@
-"""Command line: run the worker and UI, open and investigate cases, inject faults, evaluate."""
+"""Command line: health checks, fault lab, investigations, approvals, demo runs and evaluation."""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
-import logging
 import subprocess
 import sys
+import threading
 import time
+from pathlib import Path
 
 from .config import PROJECT_ROOT, get_settings
+from .faults import SCENARIOS, inject, reset, score
+from .llm import has_key
+from .telemetry import Backends, Unavailable, read_flags
+from .tools import Window, health_scan
+
+COLORS = {"node": "\033[36m", "tool": "\033[90m", "finding": "\033[32m", "report": "\033[1;35m",
+          "critique": "\033[33m", "error": "\033[31m", "approval": "\033[1;34m", "action": "\033[1;34m"}
 
 
-def _print(obj) -> None:
-    print(json.dumps(obj, indent=2, default=str))
+def _print_event(e: dict) -> None:
+    color = COLORS.get(e["kind"], "")
+    text = e["text"] if e["kind"] != "thought" else e["text"][:300]
+    print(f"{color}{time.strftime('%H:%M:%S', time.localtime(e['t']))} {e['agent']:>13} | {text}\033[0m", flush=True)
 
 
-def cmd_worker(args) -> None:
-    from .worker import Worker
-
-    worker = Worker(get_settings(), auto_investigate=None if not args.no_auto else False, alerts=not args.no_alerts)
-    print(f"worker running (model={worker.settings.model or 'unset'}, auto-investigate={worker.auto_investigate}, "
-          f"alerts={worker.alerts_enabled}); Ctrl+C to stop", flush=True)
-    try:
-        asyncio.run(worker.run())
-    except KeyboardInterrupt:
-        pass
-
-
-def cmd_ui(args) -> None:
-    app = PROJECT_ROOT / "src" / "sre_triage" / "ui" / "app.py"
-    sys.exit(subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
-                              "--server.address", "127.0.0.1", "--server.headless", "true",
-                              "--browser.gatherUsageStats", "false"]))
+def _run_live(triage, case_id: str, resume: dict | None = None) -> dict:
+    """Run the graph in a thread and stream the case's activity log to the terminal."""
+    result: dict = {}
+    seen = len(triage.cases.events(case_id))
+    worker = threading.Thread(target=lambda: result.update(triage.run(case_id, resume)), daemon=True)
+    worker.start()
+    while worker.is_alive() or seen < len(triage.cases.events(case_id)):
+        events = triage.cases.events(case_id)
+        for e in events[seen:]:
+            _print_event(e)
+        seen = len(events)
+        worker.join(0.5)
+    return result
 
 
-def cmd_open(args) -> None:
-    from .ledger import Ledger
-    from .models import CaseInput
-
-    settings = get_settings()
-    ledger = Ledger(settings.db_path)
-    now = time.time()
-    case = ledger.create_case(CaseInput(
-        service=args.service, symptom=args.symptom, incident_start=now - args.minutes * 60, incident_end=now,
-        baseline_seconds=args.baseline_minutes * 60, mode=args.mode, use_memory=not args.no_memory,
-        model=args.model))
-    print(case["id"])
-    if args.investigate:
-        args.case_id = case["id"]
-        cmd_investigate(args)
-
-
-def cmd_investigate(args) -> None:
-    from .ledger import Ledger
-    from .orchestrator import investigate
-
-    settings = get_settings()
-    ledger = Ledger(settings.db_path)
-    result = asyncio.run(investigate(ledger, settings, args.case_id, on_progress=lambda m: print(m, flush=True)))
-    _print({k: result[k] for k in ("case_id", "run_id", "status", "error", "stats")})
-    _print(result["report"])
+def _decide_interactively(triage, case_id: str, auto: str | None) -> dict:
+    while (request := triage.pending(case_id)) is not None:
+        print(f"\n>>> Proposed action: {request['description']}")
+        if auto == "approve":
+            answer = "y"
+        elif auto == "reject":
+            answer = "n"
+        else:
+            answer = input("Approve? [y]es / [n]o / or type feedback to re-investigate: ").strip()
+        if answer.lower() in ("y", "yes"):
+            _run_live(triage, case_id, {"approved": True})
+        elif answer.lower() in ("n", "no", ""):
+            _run_live(triage, case_id, {"approved": False})
+        else:
+            _run_live(triage, case_id, {"approved": False, "feedback": answer})
+    return triage.state(case_id)
 
 
-def cmd_feedback(args) -> None:
-    from .ledger import Ledger
-
-    ledger = Ledger(get_settings().db_path)
-    ledger.add_feedback(args.case_id, args.text)
-    print("feedback saved; the previous report is invalidated. Run `sre-triage investigate CASE_ID` again.")
-
-
-def cmd_decide(args) -> None:
-    from .ledger import Ledger
-
-    ledger = Ledger(get_settings().db_path)
-    action = ledger.decide_action(args.action_id, approved=args.approve, who="cli-operator", note=args.note)
-    if args.approve:
-        ledger.enqueue("execute_action", action["case_id"], {"action_id": action["id"]})
-        print("approved; the worker will execute it and then verify recovery")
-    else:
-        ledger.set_case(action["case_id"], status="needs_review")
-        print("rejected")
+def _summary(triage, case_id: str) -> None:
+    meta = triage.cases.get(case_id)
+    report = meta.get("report") or {}
+    print(f"\n=== Case {case_id}: {meta['status']} ===")
+    print(json.dumps({k: report.get(k) for k in ("status", "root_cause_service", "category", "mechanism",
+                                                  "confidence", "remediation")}, indent=2))
+    print("stats:", json.dumps(meta.get("stats", {})))
 
 
-def cmd_review(args) -> None:
-    from .ledger import Ledger
-    from .memory import review_case
-    from .models import ReviewInput
-
-    ledger = Ledger(get_settings().db_path)
-    print(review_case(ledger, args.case_id, ReviewInput(
-        outcome=args.outcome, confirmed_service=args.service, confirmed_category=args.category,
-        confirmed_cause=args.cause, notes=args.notes)))
-
-
-def cmd_cases(args) -> None:
-    from .ledger import Ledger
-
-    ledger = Ledger(get_settings().db_path)
-    for c in ledger.cases(args.limit):
-        report = c.get("report") or {}
-        print(f"{c['id']}  {time.strftime('%m-%d %H:%M', time.localtime(c['created_at']))}  {c['status']:<17} "
-              f"{c['mode']:<12} {c['service']:<16} {report.get('diagnosis_status', '-'):<21} {c['symptom'][:60]}")
-
-
-def cmd_inject(args) -> None:
-    from .faults import SCENARIOS, inject
-
-    if args.scenario not in SCENARIOS:
-        sys.exit(f"unknown scenario; choose from: {', '.join(SCENARIOS)}")
-    _print(inject(SCENARIOS[args.scenario], get_settings().flagd_file))
-
-
-def cmd_reset(args) -> None:
-    from .faults import reset
-
-    _print(reset(get_settings().flagd_file))
-
-
-def cmd_scenarios(args) -> None:
-    from .faults import SCENARIOS
-
-    for s in SCENARIOS.values():
-        print(f"{s.id:<24} {s.difficulty:<8} alert={s.alert_service:<10} {s.title}")
-
-
-def cmd_seed(args) -> None:
-    from .ledger import Ledger
-    from .memory import load_seeds
-
-    print(f"loaded {load_seeds(Ledger(get_settings().db_path), PROJECT_ROOT / 'seeds' / 'incidents.json')} seed incidents")
-
-
-def cmd_eval(args) -> None:
-    from .evaluation import run_evaluation
-    from .faults import SCENARIOS
-
-    ids = args.scenarios or [s for s in SCENARIOS]
-    unknown = [s for s in ids if s not in SCENARIOS]
-    if unknown:
-        sys.exit(f"unknown scenarios: {unknown}")
-    modes = tuple(args.modes)
-    result = asyncio.run(run_evaluation(get_settings(), ids, modes=modes, baseline_seconds=args.baseline,
-                                        use_memory=not args.no_memory, repeats=args.repeats))
-    _print({"eval_id": result["eval_id"], "out_dir": result["out_dir"], "summary": result["summary"]})
-
-
-def cmd_models(args) -> None:
-    from .llm import CATALOG, has_credentials, probe
-
-    settings = get_settings()
-    targets = args.models or [m.id for m in CATALOG]
-    print(f"default SRE_MODEL={settings.model or '(unset)'}")
-    if not args.probe:
-        for m in CATALOG:
-            print(f"{'✓' if has_credentials(m.id) else '✗ no key'}  {m.id:<55} {m.label}  {m.notes}")
-        print("run with --probe to test tool calling for real")
-        return
-
-    async def run_all():
-        return [await probe(settings, m) for m in targets]
-
-    for r in asyncio.run(run_all()):
-        status = "PASS" if r["ok"] else "FAIL"
-        print(f"{status}  {r['model']:<55} {r.get('seconds', '-')}s  calls={r.get('llm_calls', '-')}  "
-              f"tokens={r.get('tokens', '-')}  {r.get('error') or ''}"[:220])
-
-
-def cmd_doctor(args) -> None:
-    from .doctor import run_checks
-
-    ok = asyncio.run(run_checks(get_settings()))
-    sys.exit(0 if ok else 1)
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    for noisy in ("httpx", "LiteLLM", "litellm", "google_adk", "google_genai"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-    parser = argparse.ArgumentParser(prog="sre-triage", description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p = sub.add_parser("worker", help="run the change audit, alert rules and job queue")
-    p.add_argument("--no-auto", action="store_true", help="do not investigate alert cases automatically")
-    p.add_argument("--no-alerts", action="store_true")
-    p.set_defaults(func=cmd_worker)
-
-    p = sub.add_parser("ui", help="run the Streamlit dashboard")
-    p.add_argument("--port", type=int, default=8501)
-    p.set_defaults(func=cmd_ui)
-
-    p = sub.add_parser("open", help="open a case for the last N minutes")
-    p.add_argument("service")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="sre-triage")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor", help="check backends, flags and model keys")
+    sub.add_parser("health", help="anomaly scan of the last 3 minutes vs the 5 before")
+    sub.add_parser("scenarios")
+    p = sub.add_parser("inject")
+    p.add_argument("scenario", choices=SCENARIOS)
+    sub.add_parser("reset", help="all flags off, all CPU limits back to 1.0")
+    p = sub.add_parser("investigate")
     p.add_argument("symptom")
-    p.add_argument("--minutes", type=float, default=5)
-    p.add_argument("--baseline-minutes", type=float, default=10)
-    p.add_argument("--mode", choices=["multi_agent", "single_agent"], default="multi_agent")
-    p.add_argument("--no-memory", action="store_true")
-    p.add_argument("--model", default="", help="LiteLLM model for this case (default: SRE_MODEL)")
-    p.add_argument("--investigate", action="store_true", help="investigate immediately in this process")
-    p.set_defaults(func=cmd_open)
+    p.add_argument("--since", type=float, default=180, help="incident started this many seconds ago")
+    p.add_argument("--mode", choices=["multi", "single"], default="multi")
+    p.add_argument("--model")
+    p.add_argument("--auto", choices=["approve", "reject"])
+    p = sub.add_parser("decide", help="approve or reject a waiting case")
+    p.add_argument("case")
+    p.add_argument("--reject", action="store_true")
+    p.add_argument("--feedback", default="")
+    p = sub.add_parser("demo", help="inject a fault, investigate, approve, verify, reset")
+    p.add_argument("scenario", choices=SCENARIOS)
+    p.add_argument("--wait", type=float, default=100, help="seconds to let the fault develop")
+    p.add_argument("--mode", choices=["multi", "single"], default="multi")
+    p.add_argument("--model")
+    p = sub.add_parser("eval", help="run scenarios in both modes and score them")
+    p.add_argument("--scenarios", default=",".join(SCENARIOS))
+    p.add_argument("--modes", default="multi,single")
+    p.add_argument("--runs", help="explicit scenario:mode pairs, e.g. payment_failure:multi,cart_cpu_limit:single")
+    p.add_argument("--wait", type=float, default=100)
+    p.add_argument("--cooldown", type=float, default=330, help="healthy time between runs (>= baseline window)")
+    sub.add_parser("memory", help="list long-term incident memory")
+    sub.add_parser("graph", help="print the ADK workflow graph (Mermaid)")
+    sub.add_parser("ui", help="start the Streamlit dashboard")
+    args = parser.parse_args(argv)
+    settings = get_settings()
 
-    p = sub.add_parser("investigate", help="investigate a case in this process")
-    p.add_argument("case_id")
-    p.set_defaults(func=cmd_investigate)
+    if args.cmd == "ui":
+        return subprocess.call([sys.executable, "-m", "streamlit", "run", str(Path(__file__).with_name("ui.py")),
+                                "--server.headless", "true", "--browser.gatherUsageStats", "false"])
+    backends = Backends(settings)
+    if args.cmd == "doctor":
+        return doctor(settings, backends)
+    if args.cmd == "health":
+        now = time.time()
+        for svc, h in health_scan(backends, Window(now - 180, now, settings.baseline_seconds)).items():
+            print(f"{svc:>16}  p95 {h['baseline']['p95_ms']} -> {h['incident']['p95_ms']} ms   "
+                  f"err {h['baseline']['error_ratio']} -> {h['incident']['error_ratio']}   {'; '.join(h['anomalies'])}")
+        return 0
+    if args.cmd == "scenarios":
+        for s in SCENARIOS.values():
+            print(f"{s.id:24} {s.title}  (expected: {s.service}/{s.category})")
+        return 0
+    if args.cmd == "inject":
+        inject(SCENARIOS[args.scenario], backends)
+        print(f"injected {args.scenario} at {time.strftime('%H:%M:%S')}")
+        return 0
+    if args.cmd == "reset":
+        print("\n".join(reset(backends)) or "already at standard configuration")
+        return 0
+    if args.cmd == "memory":
+        from .memory import Memory
 
-    p = sub.add_parser("feedback", help="add an operator correction (invalidates the report)")
-    p.add_argument("case_id")
-    p.add_argument("text")
-    p.set_defaults(func=cmd_feedback)
+        for m in Memory(settings.data_dir).all():
+            print(f"{m['id']:28} {m.get('root_cause_service')}/{m.get('category')}  {m['title'][:70]}  "
+                  f"[{m.get('source')}, feedback={m.get('feedback')}]")
+        return 0
 
-    p = sub.add_parser("decide", help="approve or reject a proposed action")
-    p.add_argument("action_id")
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--approve", action="store_true")
-    g.add_argument("--reject", action="store_true")
-    p.add_argument("--note", default="")
-    p.set_defaults(func=cmd_decide)
+    from .workflow import Triage
 
-    p = sub.add_parser("review", help="record a reviewed outcome into incident memory")
-    p.add_argument("case_id")
-    p.add_argument("--outcome", choices=["resolved", "mitigated", "unresolved", "false_alarm"], required=True)
-    p.add_argument("--service", default="")
-    p.add_argument("--category", default="")
-    p.add_argument("--cause", default="")
-    p.add_argument("--notes", default="")
-    p.set_defaults(func=cmd_review)
+    triage = Triage(settings, backends)
+    if args.cmd == "graph":
+        print("graph TD")
+        for src, dst, route in triage.edges():
+            print(f"  {src} -->{f'|{route}|' if route else ''} {dst}")
+        return 0
+    if args.cmd == "investigate":
+        case_id = triage.open_case(args.symptom, start=time.time() - args.since, mode=args.mode, model=args.model)
+        _run_live(triage, case_id)
+        _decide_interactively(triage, case_id, args.auto)
+        _summary(triage, case_id)
+        return 0
+    if args.cmd == "decide":
+        _run_live(triage, args.case, {"approved": not args.reject, "feedback": args.feedback})
+        _summary(triage, args.case)
+        return 0
+    if args.cmd == "demo":
+        result = run_scenario(triage, backends, args.scenario, args.mode, args.wait, args.model)
+        print("score:", json.dumps(result["score"]))
+        return 0
+    if args.cmd == "eval":
+        results = []
+        out = settings.data_dir / "eval.json"
+        runs = ([tuple(r.split(":")) for r in args.runs.split(",")] if args.runs else
+                [(s, m) for s in args.scenarios.split(",") for m in args.modes.split(",")])
+        for i, (sid, mode) in enumerate(runs):
+            if i:
+                print(f"\n... cooling down {args.cooldown:.0f}s so the next baseline is healthy")
+                time.sleep(args.cooldown)
+            results.append(run_scenario(triage, backends, sid, mode, args.wait))
+            out.write_text(json.dumps(results, indent=2))
+        print_eval(results)
+        return 0
+    return 1
 
-    p = sub.add_parser("cases", help="list cases")
-    p.add_argument("--limit", type=int, default=30)
-    p.set_defaults(func=cmd_cases)
 
-    p = sub.add_parser("scenarios", help="list fault scenarios")
-    p.set_defaults(func=cmd_scenarios)
-    p = sub.add_parser("inject", help="apply a fault scenario (operator only)")
-    p.add_argument("scenario")
-    p.set_defaults(func=cmd_inject)
-    p = sub.add_parser("reset", help="restore all flags and CPU limits")
-    p.set_defaults(func=cmd_reset)
+def run_scenario(triage, backends: Backends, scenario_id: str, mode: str, wait: float, model: str | None = None) -> dict:
+    scenario = SCENARIOS[scenario_id]
+    reset(backends)
+    print(f"\n##### {scenario.id} ({mode}): {scenario.title}")
+    started = time.time()
+    inject(scenario, backends)
+    print(f"injected; letting the fault develop for {wait:.0f}s")
+    time.sleep(wait)
+    case_id = triage.open_case(scenario.symptom, start=started, mode=mode, model=model, scenario=scenario.id)
+    _run_live(triage, case_id)
+    _decide_interactively(triage, case_id, "approve")
+    _summary(triage, case_id)
+    meta = triage.cases.get(case_id)
+    result = {"case": case_id, "scenario": scenario.id, "mode": mode, "status": meta["status"],
+              "score": score(scenario, meta.get("report")), "stats": meta.get("stats", {}),
+              "report": meta.get("report")}
+    triage.cases.update(case_id, score=result["score"])
+    reset(backends)
+    return result
 
-    p = sub.add_parser("seed-memory", help="load seeded historical incidents")
-    p.set_defaults(func=cmd_seed)
 
-    p = sub.add_parser("eval", help="run scenarios in multi-agent and single-agent modes and score them")
-    p.add_argument("scenarios", nargs="*")
-    p.add_argument("--modes", nargs="+", default=["multi_agent", "single_agent"], choices=["multi_agent", "single_agent"])
-    p.add_argument("--baseline", type=float, default=300, help="healthy baseline seconds before each fault")
-    p.add_argument("--repeats", type=int, default=1)
-    p.add_argument("--no-memory", action="store_true")
-    p.set_defaults(func=cmd_eval)
+def print_eval(results: list[dict]) -> None:
+    print(f"\n{'scenario':24} {'mode':7} {'correct':8} {'service':8} {'fix':5} {'outcome':16} {'s':>5} {'llm':>4}")
+    for r in results:
+        s = r["score"]
+        print(f"{r['scenario']:24} {r['mode']:7} {str(s['correct']):8} {str(s['service']):8} "
+              f"{str(s['remediation']):5} {r['status']:16} {r['stats'].get('seconds', 0):5.0f} {r['stats'].get('llm_calls', 0):4}")
 
-    p = sub.add_parser("models", help="list catalog models; --probe tests tool calling for real")
-    p.add_argument("models", nargs="*")
-    p.add_argument("--probe", action="store_true")
-    p.set_defaults(func=cmd_models)
 
-    p = sub.add_parser("doctor", help="check backends, metric names and model configuration")
-    p.set_defaults(func=cmd_doctor)
+def doctor(settings, backends: Backends) -> int:
+    ok = True
 
-    args = parser.parse_args()
-    if getattr(args, "reject", False):
-        args.approve = False
-    args.func(args)
+    def check(name: str, fn) -> None:
+        nonlocal ok
+        try:
+            detail = fn()
+            print(f"  ok   {name}: {detail}")
+        except Exception as exc:  # report every failure, keep checking
+            ok = False
+            print(f"  FAIL {name}: {exc}")
+
+    now = time.time()
+    check("prometheus", lambda: f"checkout p95 {backends.prometheus.service_red('checkout', now - 120, now)['p95_ms']} ms")
+    def container_metrics() -> str:
+        cpu = backends.prometheus.container("cart", now - 120, now)["cpu_cores_used"]
+        if cpu is None:
+            raise Unavailable("no docker_stats metrics; run: docker restart otel-collector")
+        return f"cart uses {cpu} cores"
+
+    check("container metrics", container_metrics)
+    check("jaeger", lambda: f"{len(backends.jaeger.search('checkout', now - 120, now, limit=5))} recent checkout traces")
+    check("opensearch", lambda: f"{backends.logs.search(now - 600, now, limit=1)['total']} warning+ logs in 10 min")
+    check("docker", lambda: f"cart cpu limit {backends.docker.inspect('cart')['cpu_limit']}")
+    check("flagd file", lambda: f"{sum(1 for f in read_flags(settings.flagd_file).values() if f['variant'] != 'off')} flags on")
+    chain = [settings.model] + settings.fallback_models
+    check("model keys", lambda: ", ".join(f"{m}{'' if has_key(m) else ' (NO KEY)'}" for m in chain))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
