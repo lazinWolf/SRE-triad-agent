@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from .config import BASELINE_CPUS, DEPENDENCIES, SERVICES
 from .telemetry import Backends, Unavailable, read_flags, summarize_trace
@@ -53,7 +53,6 @@ class Toolbox:
     backends: Backends
     window: Window
     evidence: list[dict] = field(default_factory=list)
-    emit: Callable[[str, str, str], None] | None = None   # activity log (kind, agent, text)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _counters: dict[str, int] = field(default_factory=dict)
 
@@ -68,13 +67,6 @@ class Toolbox:
         return {"evidence_id": eid, **(result if isinstance(result, dict) else {"result": result})}
 
     def call(self, agent: str, name: str, args: dict) -> dict:
-        result = self._call(agent, name, args)
-        if self.emit:
-            self.emit("tool", agent, f"{name}({', '.join(f'{k}={v}' for k, v in args.items())}) -> "
-                                     f"{result.get('evidence_id') or result.get('error')}")
-        return result
-
-    def _call(self, agent: str, name: str, args: dict) -> dict:
         fn = getattr(self, name, None)
         if name not in TOOL_NAMES or fn is None:
             return {"error": f"unknown tool {name}"}

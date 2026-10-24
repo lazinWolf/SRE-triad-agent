@@ -16,7 +16,7 @@ from .llm import has_key
 from .telemetry import Backends, Unavailable, read_flags
 from .tools import Window, health_scan
 
-COLORS = {"node": "\033[36m", "tool": "\033[90m", "finding": "\033[32m", "report": "\033[1;35m",
+COLORS = {"node": "\033[36m", "agent": "\033[36m", "tool": "\033[90m", "finding": "\033[32m", "report": "\033[1;35m",
           "critique": "\033[33m", "error": "\033[31m", "approval": "\033[1;34m", "action": "\033[1;34m"}
 
 

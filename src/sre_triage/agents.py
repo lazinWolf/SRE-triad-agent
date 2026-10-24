@@ -27,15 +27,13 @@ from .prompts import COORDINATOR_PLAN, COORDINATOR_REPORT, CRITIC, specialist_sy
 from .schemas import Critique, Finding, Hypothesis, Plan, Remediation, Report, Task
 from .tools import AGENT_TOOLS, Toolbox
 
-Emit = Callable[[str, str, str], None]  # (kind, agent, text)
-
-
 @dataclass
 class Submission:
     """Holds an agent's validated answer; rejected answers go back to the model (max 3 tries)."""
 
     value: Any = None
     attempts: int = 0
+    problems: list[str] = field(default_factory=list)  # checks still failing when the last attempt was accepted
 
     def accept(self, tool_context: ToolContext, value: BaseModel) -> dict:
         self.value = value.model_dump()
@@ -47,13 +45,6 @@ class Submission:
         return {"status": "rejected", "errors": errors,
                 "instruction": "Fix these problems and call the submit tool again." if self.attempts < 3
                 else "Last attempt: submit a conservative answer that passes validation."}
-
-
-@dataclass
-class Usage:
-    calls: int = 0
-    tokens: int = 0
-    models: dict[str, int] = field(default_factory=dict)
 
 
 def _parse(value: Any) -> Any:
@@ -74,9 +65,10 @@ def _errors(exc: ValidationError) -> list[str]:
     return [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()][:8]
 
 
-# ---------------------------------------------------------------------------- callbacks
-def _callbacks(name: str, emit: Emit, usage: Usage, step_limit: int):
-    """Count model calls, log the agent's reasoning, and after `step_limit` calls offer only the submit tool."""
+# ---------------------------------------------------------------------------- step limit
+def _step_limit(step_limit: int):
+    """Agent callback (guardrail): after `step_limit` model calls offer only the submit tool, then stop the agent.
+    Monitoring of all agents (thoughts, tools, usage, errors) is done by the Runner plugin in ``callbacks``."""
     calls = {"n": 0}
 
     def before(callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
@@ -92,28 +84,13 @@ def _callbacks(name: str, emit: Emit, usage: Usage, step_limit: int):
                     f"Tool budget used. Call {submit[0].name} now with what you found, citing only evidence IDs you received."))]))
         return None
 
-    def after(callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
-        usage.calls += 1
-        meta = llm_response.usage_metadata
-        if meta:
-            usage.tokens += (meta.prompt_token_count or 0) + (meta.candidates_token_count or 0)
-        served = (llm_response.custom_metadata or {}).get("served_by")
-        if served:
-            usage.models[served] = usage.models.get(served, 0) + 1
-        for part in (llm_response.content.parts if llm_response.content else None) or []:
-            if part.text and part.text.strip():
-                emit("thought", name, part.text.strip())
-        return None
-
-    return before, after
+    return before
 
 
-def _agent(name: str, model: BaseLlm, instruction: str, tools: list, emit: Emit, usage: Usage,
-           step_limit: int) -> LlmAgent:
-    before, after = _callbacks(name, emit, usage, step_limit)
+def _agent(name: str, model: BaseLlm, instruction: str, tools: list, step_limit: int) -> LlmAgent:
     return LlmAgent(name=name, model=model, instruction=lambda _ctx: instruction, tools=tools,
                     disallow_transfer_to_parent=True, disallow_transfer_to_peers=True,
-                    before_model_callback=before, after_model_callback=after)
+                    before_model_callback=_step_limit(step_limit))
 
 
 # ---------------------------------------------------------------------------- telemetry tools
@@ -137,8 +114,7 @@ def telemetry_tools(box: Toolbox, agent: str) -> list[Callable]:
 
 
 # ---------------------------------------------------------------------------- agents
-def specialist(agent: str, model: BaseLlm, box: Toolbox, emit: Emit, usage: Usage, steps: int,
-               sub: Submission) -> LlmAgent:
+def specialist(agent: str, model: BaseLlm, box: Toolbox, steps: int, sub: Submission) -> LlmAgent:
     known = lambda: {e["id"] for e in box.evidence}  # noqa: E731
 
     def submit_finding(summary: str, tool_context: ToolContext, suspect_service: str = "",
@@ -159,10 +135,10 @@ def specialist(agent: str, model: BaseLlm, box: Toolbox, emit: Emit, usage: Usag
         return sub.accept(tool_context, finding)
 
     tools = telemetry_tools(box, agent) + [submit_finding]
-    return _agent(agent, model, specialist_system(agent), tools, emit, usage, steps)
+    return _agent(agent, model, specialist_system(agent), tools, steps)
 
 
-def planner(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission) -> LlmAgent:
+def planner(model: BaseLlm, sub: Submission) -> LlmAgent:
     def submit_plan(hypotheses: list[str], tasks: list[Task], tool_context: ToolContext) -> dict:
         """Submit 2-4 competing hypotheses and 1-3 tasks, each {agent: metrics|traces|logs_changes, question}."""
         try:
@@ -172,11 +148,10 @@ def planner(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission) -> LlmAge
         return sub.accept(tool_context, plan)
 
     # load_memory is ADK's built-in memory tool: it searches the Runner's MemoryService (memory as tool use).
-    return _agent("coordinator", model, COORDINATOR_PLAN, [load_memory, submit_plan], emit, usage, 3)
+    return _agent("coordinator", model, COORDINATOR_PLAN, [load_memory, submit_plan], 3)
 
 
-def reporter(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission, known_ids: set[str],
-             backends) -> LlmAgent:
+def reporter(model: BaseLlm, sub: Submission, known_ids: set[str], backends) -> LlmAgent:
     def submit_report(status: str, summary: str, tool_context: ToolContext, root_cause_service: str = "",
                       category: str = "unknown", mechanism: str = "", confidence: float = 0.5,
                       evidence_ids: list[str] | None = None, hypotheses: list[Hypothesis] | None = None,
@@ -201,12 +176,13 @@ def reporter(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission, known_id
         problems += remediation.validate(report.remediation.model_dump() if report.remediation else None, backends)
         if problems and sub.attempts < 2:
             return sub.reject(problems)
+        sub.problems = problems
         return sub.accept(tool_context, report)
 
-    return _agent("coordinator", model, COORDINATOR_REPORT, [submit_report], emit, usage, 2)
+    return _agent("coordinator", model, COORDINATOR_REPORT, [submit_report], 2)
 
 
-def critic(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission) -> LlmAgent:
+def critic(model: BaseLlm, sub: Submission) -> LlmAgent:
     def submit_review(verdict: str, tool_context: ToolContext, issues: list[str] | None = None,
                       follow_up: list[Task] | None = None) -> dict:
         """Submit your review: verdict "accept" or "revise", concrete issues, and at most 2 follow-up tasks."""
@@ -217,4 +193,4 @@ def critic(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission) -> LlmAgen
             return sub.reject(_errors(exc))
         return sub.accept(tool_context, review)
 
-    return _agent("critic", model, CRITIC, [submit_review], emit, usage, 2)
+    return _agent("critic", model, CRITIC, [submit_review], 2)

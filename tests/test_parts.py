@@ -11,7 +11,7 @@ import pytest
 from fakes import ScriptedModel, World, fake_backends, write_flags
 from sre_triage import remediation
 from sre_triage.a2a_critic import CARD_PATH, build_app, parse_review
-from sre_triage.agents import Submission, Usage, specialist, telemetry_tools
+from sre_triage.agents import Submission, specialist, telemetry_tools
 from sre_triage.faults import SCENARIOS, score
 from sre_triage.memory import Memory
 from sre_triage.tools import AGENT_TOOLS, Toolbox, Window
@@ -58,7 +58,7 @@ class Ctx:
 
 def test_submit_tool_rejects_unknown_evidence_then_accepts(box):
     sub = Submission()
-    agent = specialist("metrics", ScriptedModel(), box, lambda *a: None, Usage(), 3, sub)
+    agent = specialist("metrics", ScriptedModel(), box, 3, sub)
     submit = {getattr(t, "__name__", ""): t for t in agent.tools}["submit_finding"]
     ctx = Ctx()
     rejected = submit(summary="cart throttled", tool_context=ctx, suspect_service="cart", evidence_ids=["M7"])

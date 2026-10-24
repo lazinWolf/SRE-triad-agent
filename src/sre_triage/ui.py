@@ -25,7 +25,7 @@ ACTIVE = {"investigating", "remediating", "verifying"}
 STATUS_ICON = {"investigating": "🔎", "awaiting_approval": "✋", "remediating": "🛠️", "verifying": "⏱️",
                "resolved": "✅", "not_recovered": "⚠️", "inconclusive": "❔", "rejected": "🚫",
                "diagnosed_no_action": "📝", "failed": "❌", "action_failed": "❌"}
-KIND_ICON = {"node": "▶", "tool": "🔧", "thought": "💭", "finding": "📌", "plan": "🗺️", "report": "📄",
+KIND_ICON = {"node": "▶", "agent": "🤖", "tool": "🔧", "thought": "💭", "finding": "📌", "plan": "🗺️", "report": "📄",
              "critique": "🧐", "approval": "✋", "action": "🛠️", "result": "📊", "error": "❌", "validation": "↩️"}
 
 st.set_page_config(page_title="SRE Incident Triage", page_icon="🚨", layout="wide")

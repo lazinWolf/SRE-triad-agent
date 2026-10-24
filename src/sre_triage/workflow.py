@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from google.adk.agents.context import Context
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
+from google.adk.apps.app import App
 from google.adk.events import Event, RequestInput
 from google.adk.models import BaseLlm
 from google.adk.runners import Runner
@@ -32,13 +33,13 @@ from google.genai import types
 
 from . import agents, remediation
 from .a2a_critic import CARD_PATH, parse_review
+from .callbacks import ActivityLog, Usage
 from .cases import Cases
 from .config import Settings, get_settings
 from .llm import make_model
 from .memory import APP, USER, Memory
 from .telemetry import Backends
 from .tools import Toolbox, Window, compare_red, health_scan
-
 
 
 def _brief(evidence: list[dict]) -> str:
@@ -62,7 +63,7 @@ class Triage:
         self.memory = Memory(self.settings.data_dir)
         self.db_url = f"sqlite+aiosqlite:///{db_path or self.settings.data_dir / 'sessions.db'}"
         self._models: dict[str, BaseLlm] = {}
-        self.usage: dict[str, agents.Usage] = {}
+        self.usage: dict[str, Usage] = {}
         self.workflow = self._build()
 
     # ------------------------------------------------------------------ helpers
@@ -74,9 +75,6 @@ class Triage:
 
     def emitter(self, case_id: str):
         return lambda kind, agent, text: self.cases.emit(case_id, kind, agent, text)
-
-    def _usage(self, case_id: str) -> agents.Usage:
-        return self.usage.setdefault(case_id, agents.Usage())
 
     def _enter(self, ctx: Context, name: str) -> tuple[str, Callable]:
         case_id = ctx.state["case_id"]
@@ -136,7 +134,7 @@ class Triage:
                 prompt += f"\n\nThe operator REJECTED the previous diagnosis with this feedback: {feedback[-1]}"
                 state["feedback_pending"] = False
             sub = agents.Submission()
-            plan = await self._ask(ctx, agents.planner(self.model(state), emit, self._usage(case_id), sub),
+            plan = await self._ask(ctx, agents.planner(self.model(state), sub),
                                    sub, prompt, f"plan-{round_}")
             if plan:
                 tasks, state["hypotheses"] = plan["tasks"], plan["hypotheses"]
@@ -153,8 +151,8 @@ class Triage:
         state = ctx.state
         agent, case_id = node_input["agent"], state["case_id"]
         emit = self.emitter(case_id)
-        self.cases.emit(case_id, "node", "specialists", f"{agent} agent started: {node_input['question']}")
-        box = Toolbox(self.backends, Window(**state["window"]), emit=emit)
+        self.cases.emit(case_id, "node", "specialists", f"{agent} task: {node_input['question']}")
+        box = Toolbox(self.backends, Window(**state["window"]))
         prefix = agent[0].upper()
         box._counters[prefix] = sum(1 for e in state.get("evidence") or [] if e["id"].startswith(prefix))
         prompt = (self._context(state) + f"\n\nYour task from the coordinator: {node_input['question']}"
@@ -162,10 +160,8 @@ class Triage:
         sub = agents.Submission()
         steps = self.settings.agent_steps * (2 if agent == "solo" else 1)
         try:
-            finding = await self._ask(ctx, agents.specialist(agent, self.model(state), box, emit, self._usage(case_id),
-                                                             steps, sub), sub, prompt, f"{agent}-{node_input['round']}")
-        except Exception as exc:  # a failing agent must not sink the whole investigation
-            emit("error", agent, f"agent failed: {exc}")
+            finding = await self._ask(ctx, agents.specialist(agent, self.model(state), box, steps, sub), sub, prompt, f"{agent}-{node_input['round']}")
+        except Exception:  # a failing agent must not sink the whole investigation (the plugin logged the error)
             finding = None
         finding = finding or {"summary": "no finding submitted", "suspect_service": None, "category": "unknown",
                               "confidence": 0, "evidence_ids": [], "ruled_out": []}
@@ -185,28 +181,16 @@ class Triage:
             prompt += f"\n\nOperator feedback on an earlier report: {state['operator_feedback'][-1]}"
         sub = agents.Submission()
         known = {e["id"] for e in state["evidence"]}
-        report = await self._ask(ctx, agents.reporter(self.model(state), emit, self._usage(case_id), sub, known,
-                                                      self.backends), sub, prompt, f"report-{state['round']}")
+        report = await self._ask(ctx, agents.reporter(self.model(state), sub, known, self.backends), sub, prompt, f"report-{state['round']}")
         report = report or {"status": "inconclusive", "summary": "The coordinator gave no valid report.",
                             "root_cause_service": None, "category": "unknown", "mechanism": "", "confidence": 0,
                             "evidence_ids": [], "hypotheses": [], "remediation": None}
-        checks = self._checks(report, known)
+        checks = sub.problems  # guardrail failures the coordinator did not fix (see agents.reporter)
         state["report"], state["checks"] = report, checks
         emit("report", "coordinator", f"{report['status']}: {report['summary']}"
              + (f"\nChecks failed: {'; '.join(checks)}" if checks else ""))
         ctx.route = "critic" if state["mode"] == "multi" else "approval"
         return {"status": report["status"]}
-
-    def _checks(self, report: dict, known: set[str]) -> list[str]:
-        """Deterministic guardrails: citations exist, a diagnosis has evidence, the action is allowlisted."""
-        problems = []
-        cited = set(report.get("evidence_ids") or []) | {i for h in report.get("hypotheses") or []
-                                                         for i in h.get("evidence_ids") or []}
-        if unknown := sorted(cited - known):
-            problems.append(f"cites evidence that does not exist: {', '.join(unknown)}")
-        if report["status"] == "diagnosed" and not set(report.get("evidence_ids") or []) & known:
-            problems.append("diagnosis cites no evidence")
-        return problems + remediation.validate(report.get("remediation"), self.backends)
 
     async def critic(self, ctx: Context, node_input: Any = None):
         """Reflection: review the report. Uses the Critic A2A service when configured, else a local LlmAgent."""
@@ -231,7 +215,7 @@ class Triage:
                 emit("error", "critic", f"A2A critic unavailable ({str(exc)[:200]}); using the local critic")
         if review is None:
             sub = agents.Submission()
-            review = await self._ask(ctx, agents.critic(self.model(state), emit, self._usage(case_id), sub),
+            review = await self._ask(ctx, agents.critic(self.model(state), sub),
                                      sub, prompt, f"critic-{state['round']}")
         review = review or {"verdict": "accept", "issues": ["critic gave no valid review"], "follow_up": []}
         if state.get("checks"):
@@ -393,8 +377,8 @@ class Triage:
             await self._run_with(sessions, case_id, resume)
 
     async def _run_with(self, sessions: DatabaseSessionService, case_id: str, resume: dict | None) -> None:
-        runner = Runner(node=self.workflow, app_name=APP, session_service=sessions,
-                        memory_service=self.memory.service)
+        app = App(name=APP, root_agent=self.workflow, plugins=[ActivityLog(self.cases, self.usage)])
+        runner = Runner(app=app, session_service=sessions, memory_service=self.memory.service)
         if resume is None:
             meta = self.cases.get(case_id)
             meta["window"]["end"] = time.time()

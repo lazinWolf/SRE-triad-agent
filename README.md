@@ -61,7 +61,8 @@ The **Inside ADK** page reads a case's ADK session back from SQLite and shows:
 | Agent-to-agent (A2A) | The Critic can run as its own service (`a2a_critic.py`, ADK `to_a2a`) and is called through `RemoteA2aAgent`. If it is unreachable, the local Critic is used |
 | Reflection | Critic → revise → specialists loop (bounded by `max_revisions`) |
 | Self-correction | Every agent ends with a `submit_*` tool that validates the answer (schema, real evidence IDs, allowlisted action); errors go back to the model |
-| Guardrails | Evidence-citation checks, a remediation allowlist, a per-agent step budget, rollback when recovery fails |
+| Guardrails | Evidence-citation checks, a remediation allowlist, a per-agent step budget (agent `before_model_callback`), rollback when recovery fails |
+| Monitoring with callbacks | An ADK plugin on the Runner (`callbacks.py`) logs every agent start and finish, tool call, validation outcome, model reasoning, token usage and error into the case's activity log |
 | Human feedback | Approve / reject with feedback (re-plans), and 👍/👎 ratings stored in memory |
 | Evaluation | `sre-triage eval`: injected faults with ground truth, multi-agent vs single-agent baseline |
 | Model resilience | `FallbackLlm` (an ADK `BaseLlm`) over ADK `LiteLlm` models; rate-limited or overloaded models are skipped for a while |
@@ -119,7 +120,8 @@ The agents never see `faults.py`. Faults are applied the same way a real operato
 ```
 src/sre_triage/
   workflow.py     ADK Workflow: nodes, routes, parallel specialists, approval RequestInput, SQLite sessions
-  agents.py       ADK LlmAgents, their tools and validating submit_* tools, step limits, usage callbacks
+  agents.py       ADK LlmAgents, their tools and validating submit_* tools, step-limit callback
+  callbacks.py    ADK plugin: activity log of agents, tools, validations, usage and errors
   llm.py          FallbackLlm: ADK LiteLlm models with a fallback chain
   tools.py        agent tools + evidence recording; deterministic health scan
   telemetry.py    Prometheus / Jaeger / OpenSearch / Docker / flagd clients

@@ -91,7 +91,9 @@ def test_invalid_submissions_are_returned_to_the_model(tmp_path, world):
     case = t.open_case("Checkout latency is elevated")
     state = t.run(case)
     assert len(attempts) == 2
-    assert any(e["kind"] == "validation" or "rejected" in e["text"] for e in t.cases.events(case)) or len(attempts) == 2
+    # the Runner plugin logs each validation outcome
+    assert [e["text"].split(" (")[0] for e in t.cases.events(case) if e["text"].startswith("submit_report")] == [
+        "submit_report: rejected", "submit_report: accepted"]
     assert state["report"]["root_cause_service"] == "cart"
     assert state["checks"] == []
 
@@ -103,7 +105,7 @@ def test_guardrails_strip_unverifiable_remediation(tmp_path, world):
     t = make(tmp_path, world, ScriptedModel({"report": submit("submit_report", bad)}))
     case = t.open_case("Checkout latency is elevated")
     state = t.run(case)
-    assert any("does not exist" in c for c in state["checks"])
+    assert any("do not exist" in c for c in state["checks"])
     assert any("unknown feature flag" in c for c in state["checks"])
     assert state["critiques"][0]["verdict"] == "revise"           # forced by the checks
     assert state["report"]["remediation"] is None                  # still failing after the revision
@@ -161,3 +163,20 @@ def test_unreachable_a2a_critic_falls_back_to_local_critic(tmp_path, world):
     state = t.run(case)
     assert state["critiques"][-1]["verdict"] == "accept" and not state["critiques"][-1].get("via")
     assert t.cases.get(case)["status"] == "awaiting_approval"
+
+
+def test_callbacks_log_agents_tools_usage_and_errors(tmp_path, world):
+    def overloaded(request):
+        raise RuntimeError("503 model overloaded")
+
+    t = make(tmp_path, world, ScriptedModel({"metrics": overloaded}))
+    case = t.open_case("Checkout latency is elevated")
+    t.run(case)
+    events = t.cases.events(case)
+    logged = {(e["kind"], e["agent"], e["text"].split(" -> ")[0]) for e in events}
+    assert {("agent", "logs_changes", "started"), ("agent", "logs_changes", "finished"),
+            ("tool", "logs_changes", "recent_changes()"), ("tool", "logs_changes", "submit_finding: accepted"),
+            ("thought", "logs_changes", "Checking.")} <= logged
+    assert any(e["kind"] == "error" and e["agent"] == "metrics" and "503 model overloaded" in e["text"] for e in events)
+    assert t.cases.get(case)["status"] == "awaiting_approval"  # one failed agent does not sink the case
+    assert t.cases.get(case)["stats"]["llm_calls"] >= 5
