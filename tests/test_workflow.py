@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from fakes import ScriptedModel, World, call, fake_backends, settings_for, submit, write_flags
+from sre_triage import adk_view
 from sre_triage.workflow import Triage
 
 
@@ -130,3 +131,33 @@ def test_inconclusive_report_ends_without_action(tmp_path, world):
     assert state["report"]["remediation"] is None
     assert t.cases.get(case)["status"] == "inconclusive"
     assert world.restarts == []
+
+
+def test_adk_session_exposes_events_state_react_and_validation(tmp_path, world):
+    t = make(tmp_path, world, ScriptedModel())
+    case = t.open_case("Checkout latency is elevated")
+    t.run(case)
+    session = t.session(case)
+    assert session.state["findings"] and session.state["report"]["root_cause_service"] == "cart"
+    rows = adk_view.event_rows(session.events)
+    assert {"plan", "specialists/metrics", "synthesize"} <= {r["node"] for r in rows}
+    assert any(r["branch"] for r in rows), "parallel specialists run on their own branches"
+    written = {k.strip() for r in adk_view.state_timeline(session.events) for k in r["keys"].split(",")}
+    assert {"hypotheses", "findings", "report"} <= written
+    traces = adk_view.react_traces(session.events)
+    metrics = next(steps for name, steps in traces.items() if name.startswith("metrics"))
+    steps = [s["step"] for s in metrics]
+    assert "Action" in steps and steps[steps.index("Action") + 1] == "Observation"
+    assert {(v["tool"], v["status"]) for v in adk_view.validations(session.events)} >= {
+        ("submit_plan", "accepted"), ("submit_finding", "accepted"), ("submit_report", "accepted")}
+
+
+def test_unreachable_a2a_critic_falls_back_to_local_critic(tmp_path, world):
+    settings = settings_for(tmp_path)
+    settings.critic_a2a_url = "http://127.0.0.1:9"  # nothing listens here
+    t = Triage(settings, fake_backends(world), model_factory=lambda name: ScriptedModel(),
+               db_path=str(tmp_path / "sessions.db"))
+    case = t.open_case("Checkout latency is elevated")
+    state = t.run(case)
+    assert state["critiques"][-1]["verdict"] == "accept" and not state["critiques"][-1].get("via")
+    assert t.cases.get(case)["status"] == "awaiting_approval"

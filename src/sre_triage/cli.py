@@ -98,12 +98,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--runs", help="explicit scenario:mode pairs, e.g. payment_failure:multi,cart_cpu_limit:single")
     p.add_argument("--wait", type=float, default=100)
     p.add_argument("--cooldown", type=float, default=330, help="healthy time between runs (>= baseline window)")
-    sub.add_parser("memory", help="list long-term incident memory")
+    sub.add_parser("memory", help="list long-term incident memory (ADK SqliteMemoryService)")
+    p = sub.add_parser("a2a-critic", help="serve the Critic agent over A2A")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8001)
     sub.add_parser("graph", help="print the ADK workflow graph (Mermaid)")
     sub.add_parser("ui", help="start the Streamlit dashboard")
     args = parser.parse_args(argv)
     settings = get_settings()
 
+    if args.cmd == "a2a-critic":
+        from .a2a_critic import serve
+
+        print(f"Critic A2A service on http://{args.host}:{args.port}  "
+              f"(agent card: http://{args.host}:{args.port}/.well-known/agent-card.json)")
+        serve(settings, args.host, args.port)
+        return 0
     if args.cmd == "ui":
         return subprocess.call([sys.executable, "-m", "streamlit", "run", str(Path(__file__).with_name("ui.py")),
                                 "--server.headless", "true", "--browser.gatherUsageStats", "false"])
@@ -227,6 +237,10 @@ def doctor(settings, backends: Backends) -> int:
     check("opensearch", lambda: f"{backends.logs.search(now - 600, now, limit=1)['total']} warning+ logs in 10 min")
     check("docker", lambda: f"cart cpu limit {backends.docker.inspect('cart')['cpu_limit']}")
     check("flagd file", lambda: f"{sum(1 for f in read_flags(settings.flagd_file).values() if f['variant'] != 'off')} flags on")
+    if settings.critic_a2a_url:
+        from .a2a_critic import agent_card
+
+        check("critic A2A service", lambda: f"{agent_card(settings.critic_a2a_url)['name']} at {settings.critic_a2a_url}")
     chain = [settings.model] + settings.fallback_models
     check("model keys", lambda: ", ".join(f"{m}{'' if has_key(m) else ' (NO KEY)'}" for m in chain))
     return 0 if ok else 1

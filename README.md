@@ -26,15 +26,28 @@ START → detect → recall → plan → specialists → synthesize ─multi─�
 | Node | What it does |
 |---|---|
 | `detect` | Deterministic anomaly scan: RED metrics for every service, incident window vs the healthy baseline just before it |
-| `recall` | Pulls similar past incidents from long-term memory |
+| `recall` | Searches ADK memory (`SqliteMemoryService`) for similar past incidents |
 | `plan` | The **Coordinator** LLM writes competing hypotheses and delegates 1-3 focused tasks |
 | `specialists` | An ADK parallel-worker node: one **specialist** `LlmAgent` per task, all running concurrently. Each runs a ReAct tool loop over its own tools and ends by calling `submit_finding`, citing evidence IDs |
 | `synthesize` | The Coordinator merges the findings into a root-cause report and at most one remediation. Code then checks that the cited evidence exists and that the action is on the allowlist |
-| `critic` | A **Critic** LLM reviews the report. A failed check or a concrete objection sends follow-up tasks back to the specialists (once) |
+| `critic` | A **Critic** LLM reviews the report, locally or as a remote **A2A** agent. A failed check or a concrete objection sends follow-up tasks back to the specialists (once) |
 | `approval` → `decide` | **Human in the loop**: the workflow pauses with an ADK `RequestInput`; the session is stored in SQLite, so the case can be approved later from the CLI or the dashboard. A rejection with feedback re-plans |
 | `remediate` | Executes the approved action (set a CPU limit, turn a feature flag off, or restart a service) and records how to undo it |
 | `verify` | Waits, then compares the alerting services with the baseline. If they have not recovered, the action is rolled back |
-| `learn` | Writes the incident to long-term memory. Operator ratings (👍/👎) later change how much it is trusted |
+| `learn` | Writes the incident to ADK memory. Operator ratings (👍/👎) are added to its memory text, so later agents see them |
+
+### ADK concepts you can see in the dashboard
+
+The **Inside ADK** page reads a case's ADK session back from SQLite and shows:
+
+| Concept | What you see |
+|---|---|
+| `Runner` + `DatabaseSessionService` | Every event the Runner produced: author, workflow node path, parallel branch, tool calls and responses |
+| Session state | The current `session.state`, and which node wrote which key (`state_delta` per event) |
+| ReAct | Per agent: Thought → Action (tool call) → Observation (tool result) |
+| Pydantic validation | Every `submit_*` answer, accepted or rejected with the validation errors, and the JSON schemas the agents fill |
+| A2A | The remote Critic's agent card (`/.well-known/agent-card.json`) and the messages it returned |
+| `Workflow` graph | The edges and routes that produced the run |
 
 ### Agentic patterns used
 
@@ -44,7 +57,8 @@ START → detect → recall → plan → specialists → synthesize ─multi─�
 | Graph flow with routes and loops | ADK `Workflow` with routed edges (`ctx.route`), a parallel-worker fan-out and agents run as dynamic child nodes (`workflow.py`) |
 | Tool use / ReAct loop | Seven read-only ADK function tools over Prometheus, Jaeger, OpenSearch, Docker and flagd (`tools.py`, `agents.py`) |
 | Shared memory (blackboard) | ADK session state: findings and evidence accumulate across rounds and every agent reads them |
-| Long-term memory | `memory.py`: seeded runbook incidents plus every diagnosed case, recalled by similarity |
+| Long-term memory | ADK `SqliteMemoryService` (`memory.py`): seeded runbook incidents plus every diagnosed case. The `recall` node searches it, and the coordinator can search it itself with ADK's `load_memory` tool |
+| Agent-to-agent (A2A) | The Critic can run as its own service (`a2a_critic.py`, ADK `to_a2a`) and is called through `RemoteA2aAgent`. If it is unreachable, the local Critic is used |
 | Reflection | Critic → revise → specialists loop (bounded by `max_revisions`) |
 | Self-correction | Every agent ends with a `submit_*` tool that validates the answer (schema, real evidence IDs, allowlisted action); errors go back to the model |
 | Guardrails | Evidence-citation checks, a remediation allowlist, a per-agent step budget, rollback when recovery fails |
@@ -61,6 +75,15 @@ uv sync --extra dev
 uv run sre-triage doctor        # every check should say ok
 uv run sre-triage ui            # dashboard on http://localhost:8501
 ```
+
+To review reports over A2A, start the Critic service and point the workflow at it:
+
+```bash
+uv run sre-triage a2a-critic --port 8001                  # agent card on :8001/.well-known/agent-card.json
+SRE_CRITIC_A2A_URL=http://127.0.0.1:8001 uv run sre-triage ui
+```
+
+`scripts/start.sh` does all of this.
 
 The shop's host port is 8090 so it does not clash with other tools on 8080. Set `SRE_SHOP_PORT` to change it.
 
@@ -102,7 +125,9 @@ src/sre_triage/
   telemetry.py    Prometheus / Jaeger / OpenSearch / Docker / flagd clients
   prompts.py      coordinator, specialist and critic prompts
   schemas.py      Pydantic answers: Plan, Finding, Report, Critique
-  memory.py       long-term incident memory with feedback
+  memory.py       long-term incident memory on ADK SqliteMemoryService, with feedback
+  a2a_critic.py   the Critic as an A2A service (ADK to_a2a) + Pydantic check of its answers
+  adk_view.py     reads an ADK session back as events, state changes, ReAct traces, validations
   remediation.py  allowlist, execute, rollback
   cases.py        case records + live activity log (data/cases/)
   faults.py       fault scenarios and scoring (operator only)

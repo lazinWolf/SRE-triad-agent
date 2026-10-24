@@ -32,13 +32,15 @@ SPECIALIST = {
 def specialist_system(agent: str) -> str:
     return (f"{SPECIALIST[agent]}\n{ARCHITECTURE}\n{RULES}\nCategories: {CATEGORIES}\n"
             "Work in a loop: think about what to check, call one tool, read the result, repeat. "
+            "This is a ReAct loop: before each tool call write one short line 'Thought: <why this call>'. "
             "When done (at most a handful of tool calls), call submit_finding.")
 
 
 COORDINATOR_PLAN = (
     "You are the incident Coordinator of a team of SRE agents: metrics, traces and logs_changes. "
     f"{ARCHITECTURE}\nGiven the alert, the anomaly scan, similar past incidents and any earlier findings or feedback, "
-    "write 2-4 competing hypotheses and delegate 1-3 focused tasks (one per agent at most) by calling submit_plan."
+    "You may call load_memory to search past incidents. Then write 2-4 competing hypotheses and delegate "
+    "1-3 focused tasks (one per agent at most) by calling submit_plan."
 )
 
 COORDINATOR_REPORT = (
@@ -59,3 +61,9 @@ CRITIC = (
     "fix for the cause? An 'inconclusive' report on weak evidence is acceptable. Ask for revision only for "
     "a concrete problem, with at most 2 follow-up tasks for the specialists. Call submit_review."
 )
+
+# The same Critic, served over A2A: no tools, so it answers with JSON that the caller validates with Pydantic.
+CRITIC_A2A = CRITIC.replace(
+    "Call submit_review.",
+    "Reply with ONLY a JSON object: {\"verdict\": \"accept\" or \"revise\", \"issues\": [str], "
+    "\"follow_up\": [{\"agent\": \"metrics\" | \"traces\" | \"logs_changes\", \"question\": str}]}.")

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from types import SimpleNamespace
-
 from fakes import ScriptedModel, World, fake_backends, write_flags
 from sre_triage import remediation
+from sre_triage.a2a_critic import CARD_PATH, build_app, parse_review
 from sre_triage.agents import Submission, Usage, specialist, telemetry_tools
 from sre_triage.faults import SCENARIOS, score
 from sre_triage.memory import Memory
@@ -70,18 +71,38 @@ def test_submit_tool_rejects_unknown_evidence_then_accepts(box):
     assert submit(summary="x", tool_context=Ctx(), category="not-a-category")["status"] == "rejected"
 
 
-def test_memory_recall_prefers_similar_and_trusted_incidents(tmp_path):
+def test_adk_memory_service_seeds_searches_learns_and_records_feedback(tmp_path):
     mem = Memory(tmp_path)
-    assert len(mem.all()) == 5  # seeded
-    hits = mem.recall("checkout latency, cart CPU throttling after quota change", ["cart", "checkout"])
-    assert hits and hits[0]["root_cause_service"] in ("cart", "currency")
-    mem.remember({"id": "c1", "title": "cart CPU limit cut", "symptom": "checkout latency", "services": ["cart", "checkout"],
-                  "root_cause_service": "cart", "category": "cpu_limit", "mechanism": "throttling"})
-    query = ("cart CPU limit cut, throttling", ["cart", "checkout"])
-    assert mem.recall(*query)[0]["id"] == "c1"
-    assert mem.rate("c1", correct=False, note="it was valkey")
-    assert mem.recall(*query)[0]["id"] != "c1"
-    assert {m["id"]: m for m in mem.all()}["c1"]["feedback"] == "incorrect"
+    assert mem.all() == []
+    hits = asyncio.run(mem.search("checkout latency cart CPU throttling"))  # first search seeds the runbook
+    assert len(mem.all()) == 5
+    assert hits and hits[0]["root_cause_service"] == "cart"
+    mem.remember({"id": "c1", "title": "valkey eviction storm", "symptom": "cart errors", "services": ["cart"],
+                  "root_cause_service": "valkey-cart", "category": "resource_saturation", "mechanism": "evictions"})
+    assert asyncio.run(mem.search("valkey eviction"))[0]["id"] == "c1"
+    assert mem.rate("c1", correct=False, note="it was the network")
+    records = {m["id"]: m for m in mem.all()}
+    assert len(records) == 6 and records["c1"]["feedback"] == "incorrect"  # rating updates, not duplicates
+    assert not mem.rate("missing", correct=True)
+    # agents see the feedback in the memory text that load_memory returns
+    found = asyncio.run(mem.service.search_memory(app_name="sre_triage", user_id="operator", query="valkey eviction"))
+    assert any("INCORRECT" in (p.text or "") for m in found.memories for p in m.content.parts)
+
+
+def test_a2a_answers_are_validated_as_critiques():
+    assert parse_review('```json\n{"verdict": "revise", "issues": ["no trace evidence"]}\n```')["verdict"] == "revise"
+    with pytest.raises(ValueError):
+        parse_review("looks good to me")
+    with pytest.raises(ValueError):
+        parse_review('{"verdict": "maybe"}')
+
+
+def test_a2a_critic_publishes_an_agent_card():
+    from starlette.testclient import TestClient
+
+    with TestClient(build_app(ScriptedModel(), port=8123)) as client:
+        card = client.get(CARD_PATH).json()
+    assert card["name"] == "critic" and card["supportedInterfaces"][0]["url"] == "http://127.0.0.1:8123"
 
 
 def test_remediation_allowlist(tmp_path):
@@ -104,3 +125,28 @@ def test_scoring():
     control = SCENARIOS["healthy_control"]
     assert score(control, {"status": "inconclusive"})["correct"]
     assert score(control, good)["false_alarm"]
+
+
+def test_fallback_skips_a_model_that_sends_an_invalid_tool_call(monkeypatch):
+    from google.adk.models.lite_llm import LiteLlm
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    from sre_triage.config import Settings
+    from sre_triage.llm import FallbackLlm
+
+    async def fake(self, request, stream=False):
+        if self.model == "groq/bad":
+            raise RuntimeError("Tool call validation failed: parameters for tool submit_report did not match schema")
+        yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="ok")]))
+
+    monkeypatch.setattr(LiteLlm, "generate_content_async", fake)
+    llm = FallbackLlm(["groq/bad", "groq/good"], Settings())
+    request = LlmRequest(contents=[types.Content(role="user", parts=[types.Part(text="hi")])])
+
+    async def run():
+        return [r async for r in llm.generate_content_async(request)]
+
+    [response] = asyncio.run(run())
+    assert response.custom_metadata["served_by"] == "groq/good"

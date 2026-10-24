@@ -47,7 +47,7 @@ _lock = threading.Lock()
 
 def _cooldown_for(error: Exception) -> float:
     text = str(error).lower()
-    if "tool_use_failed" in text or "failed_generation" in text:
+    if "tool_use_failed" in text or "failed_generation" in text or "tool call validation failed" in text:
         return 0  # malformed tool call: the model, not the provider, is at fault
     if "per day" in text or "perday" in text or "daily" in text:
         return 6 * 3600
@@ -94,8 +94,9 @@ class FallbackLlm(BaseLlm):
                 except Exception as exc:  # rate limits, overload, timeouts: next model
                     last = exc
                     seconds = _cooldown_for(exc)
-                    if not seconds:
-                        raise
+                    if not seconds:  # this model botched the tool call; let the next model answer this request
+                        log.warning("model %s sent an invalid tool call: %s", inner.model, str(exc)[:160])
+                        continue
                     log.warning("model %s unavailable for %.0fs: %s", inner.model, seconds, str(exc)[:160])
                     with _lock:
                         _cooldown[inner.model] = time.time() + seconds

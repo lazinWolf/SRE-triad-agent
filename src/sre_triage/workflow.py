@@ -22,7 +22,8 @@ import time
 from typing import Any, Callable
 
 from google.adk.agents.context import Context
-from google.adk.events import RequestInput
+from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
+from google.adk.events import Event, RequestInput
 from google.adk.models import BaseLlm
 from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService
@@ -30,15 +31,14 @@ from google.adk.workflow import DEFAULT_ROUTE, START, Workflow, node
 from google.genai import types
 
 from . import agents, remediation
+from .a2a_critic import CARD_PATH, parse_review
 from .cases import Cases
 from .config import Settings, get_settings
 from .llm import make_model
-from .memory import Memory
+from .memory import APP, USER, Memory
 from .telemetry import Backends
 from .tools import Toolbox, Window, compare_red, health_scan
 
-APP = "sre_triage"
-USER = "operator"
 
 
 def _brief(evidence: list[dict]) -> str:
@@ -109,11 +109,11 @@ class Triage:
     async def recall(self, ctx: Context, node_input: Any = None) -> dict:
         case_id, emit = self._enter(ctx, "recall")
         anomalies = ctx.state.get("anomalies") or []
-        memories = self.memory.recall(ctx.state["symptom"] + " " + " ".join(anomalies),
-                                      [a.split(":")[0] for a in anomalies])
+        # ADK MemoryService search (SQLite full-text); the coordinator can also search it with load_memory
+        memories = await self.memory.search(ctx.state["symptom"] + " " + " ".join(anomalies))
         ctx.state["memories"] = memories
-        emit("result", "memory", "Recalled: " + (", ".join(f"{m['title']} ({m['similarity']})" for m in memories)
-                                                 or "nothing similar"))
+        emit("result", "memory", "Recalled from ADK memory: " + (", ".join(m["title"] for m in memories)
+                                                                 or "nothing similar"))
         return {"recalled": len(memories)}
 
     async def plan(self, ctx: Context, node_input: Any = None) -> list[dict]:
@@ -208,15 +208,31 @@ class Triage:
             problems.append("diagnosis cites no evidence")
         return problems + remediation.validate(report.get("remediation"), self.backends)
 
-    async def critic(self, ctx: Context, node_input: Any = None) -> list[dict] | dict:
+    async def critic(self, ctx: Context, node_input: Any = None):
+        """Reflection: review the report. Uses the Critic A2A service when configured, else a local LlmAgent."""
         case_id, emit = self._enter(ctx, "critic")
         state = ctx.state
         prompt = (f"{self._context(state)}\n\nReport:\n{json.dumps(state['report'])}\n\nAutomatic checks: "
                   f"{state.get('checks') or 'passed'}\n\nFindings:\n{_findings_text(state['findings'])}"
                   f"\n\nEvidence:\n{_brief(state['evidence'])}")
-        sub = agents.Submission()
-        review = await self._ask(ctx, agents.critic(self.model(state), emit, self._usage(case_id), sub),
-                                 sub, prompt, f"critic-{state['round']}")
+        review = None
+        if url := self.settings.critic_a2a_url:
+            # A2A: the remote agent reads the conversation from the session, so put the request there first.
+            yield Event(author=self.workflow.name, content=types.Content(role="user", parts=[types.Part(text=prompt)]))
+            emit("a2a", "critic", f"Sending the report to the Critic A2A service at {url}")
+            try:
+                remote = RemoteA2aAgent(name="remote_critic", agent_card=url.rstrip("/") + CARD_PATH,
+                                        description="Critic served over A2A")
+                answer = await ctx.run_node(remote, node_input=prompt, run_id=f"a2a-critic-{state['round']}")
+                review = parse_review(str(answer))
+                review["via"] = "a2a"
+                emit("a2a", "critic", "A2A answer received and validated against the Critique schema")
+            except Exception as exc:  # unreachable service or invalid answer: fall back to the local critic
+                emit("error", "critic", f"A2A critic unavailable ({str(exc)[:200]}); using the local critic")
+        if review is None:
+            sub = agents.Submission()
+            review = await self._ask(ctx, agents.critic(self.model(state), emit, self._usage(case_id), sub),
+                                     sub, prompt, f"critic-{state['round']}")
         review = review or {"verdict": "accept", "issues": ["critic gave no valid review"], "follow_up": []}
         if state.get("checks"):
             review["verdict"] = "revise"
@@ -229,9 +245,10 @@ class Triage:
             if state.get("checks"):  # never show an unchecked action to the operator
                 state["report"] = {**state["report"], "remediation": None}
         state["critiques"] = (state.get("critiques") or []) + [review]
-        emit("critique", "critic", f"{review['verdict']}: " + ("; ".join(review["issues"]) or "no issues"))
+        emit("critique", "critic", f"{review['verdict']}{' (via A2A)' if review.get('via') else ''}: "
+             + ("; ".join(review["issues"]) or "no issues"))
         ctx.route = "revise" if review["verdict"] == "revise" else "accept"
-        return review
+        yield review
 
     async def approval(self, ctx: Context, node_input: Any = None):
         case_id, emit = self._enter(ctx, "approval")
@@ -326,13 +343,13 @@ class Triage:
             outcome = "rejected"
         state["outcome"] = outcome
         if report.get("status") == "diagnosed":
-            self.memory.remember({
+            await self.memory.add({
                 "id": case_id, "title": report.get("summary", "")[:120], "symptom": state["symptom"],
                 "root_cause_service": report.get("root_cause_service"), "category": report.get("category"),
                 "mechanism": report.get("mechanism"), "services": [a.split(":")[0] for a in state.get("anomalies") or []],
                 "remediation": report.get("remediation"), "outcome": outcome, "source": "case",
                 "lessons": "; ".join(state.get("operator_feedback") or []) or report.get("mechanism", ""),
-                "feedback": "incorrect" if outcome == "rejected" else None})
+                "feedback": "incorrect" if outcome == "rejected" else None, "created": time.time()})
             emit("result", "memory", "Stored this incident in long-term memory")
         self.cases.update(case_id, status=outcome, report=report)
         return {"outcome": outcome}
@@ -376,7 +393,8 @@ class Triage:
             await self._run_with(sessions, case_id, resume)
 
     async def _run_with(self, sessions: DatabaseSessionService, case_id: str, resume: dict | None) -> None:
-        runner = Runner(node=self.workflow, app_name=APP, session_service=sessions)
+        runner = Runner(node=self.workflow, app_name=APP, session_service=sessions,
+                        memory_service=self.memory.service)
         if resume is None:
             meta = self.cases.get(case_id)
             meta["window"]["end"] = time.time()
@@ -407,6 +425,13 @@ class Triage:
             stats.update(llm_calls=usage.calls, tokens=usage.tokens, models_used=usage.models)
         self.cases.update(case_id, stats=stats, report=state.get("report"))
         return state
+
+    def session(self, case_id: str):
+        """The ADK session of a case: every Runner event plus the final state."""
+        async def read():
+            async with DatabaseSessionService(db_url=self.db_url) as sessions:
+                return await sessions.get_session(app_name=APP, user_id=USER, session_id=case_id)
+        return asyncio.run(read())
 
     def state(self, case_id: str) -> dict:
         async def read() -> dict:

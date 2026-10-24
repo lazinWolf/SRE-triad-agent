@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Start the demo (if needed) and the dashboard on http://localhost:8501.
+# Start the demo (if needed), the Critic A2A service on :8001 and the dashboard on http://localhost:8501.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 docker ps --format '{{.Names}}' | grep -qx prometheus || infra/sre/demo.sh up
 uv sync --extra dev
+uv run sre-triage a2a-critic --port 8001 &
+critic=$!
+trap 'kill $critic 2>/dev/null' EXIT
+export SRE_CRITIC_A2A_URL=http://127.0.0.1:8001
+sleep 3
 uv run sre-triage doctor || true
-exec uv run sre-triage ui
+uv run sre-triage ui

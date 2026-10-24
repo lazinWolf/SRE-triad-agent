@@ -40,6 +40,7 @@ class Settings(BaseModel):
     agent_steps: int = 5              # tool calls per specialist before it must report
     max_revisions: int = 1            # critic -> re-investigate loops
     verify_wait_seconds: float = 75   # settle time before checking recovery
+    critic_a2a_url: str = ""          # e.g. http://127.0.0.1:8001 to use the Critic A2A service
 
     @property
     def flagd_file(self) -> Path:
@@ -56,7 +57,8 @@ def get_settings() -> Settings:
     for field, var in (("model", "SRE_MODEL"), ("prometheus_url", "SRE_PROMETHEUS_URL"),
                        ("jaeger_url", "SRE_JAEGER_URL"), ("opensearch_url", "SRE_OPENSEARCH_URL"),
                        ("docker_socket", "SRE_DOCKER_SOCKET"), ("demo_dir", "SRE_DEMO_DIR"),
-                       ("data_dir", "SRE_DATA_DIR"), ("verify_wait_seconds", "SRE_VERIFY_WAIT_SECONDS")):
+                       ("data_dir", "SRE_DATA_DIR"), ("verify_wait_seconds", "SRE_VERIFY_WAIT_SECONDS"),
+                       ("critic_a2a_url", "SRE_CRITIC_A2A_URL")):
         if env.get(var):
             values[field] = env[var]
     if env.get("SRE_FALLBACK_MODELS"):

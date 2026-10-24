@@ -1,6 +1,7 @@
 """The ADK agents: Coordinator (plan / report), three specialists, a single-agent baseline and a Critic.
 
-Every agent is a Google ADK ``LlmAgent``. Specialists get read-only telemetry tools. Every agent
+Every agent is a Google ADK ``LlmAgent``. Specialists get read-only telemetry tools; the coordinator gets
+ADK's ``load_memory`` tool. (The Critic can also run as a separate A2A service: see ``a2a_critic``.) Every agent
 finishes by calling a ``submit_*`` tool; the tool validates the answer in code (schema, evidence IDs,
 remediation allowlist) and returns the errors to the model so it can correct itself.
 """
@@ -17,7 +18,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
-from google.adk.tools import ToolContext
+from google.adk.tools import ToolContext, load_memory
 from google.genai import types
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
@@ -170,7 +171,8 @@ def planner(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission) -> LlmAge
             return sub.reject(_errors(exc))
         return sub.accept(tool_context, plan)
 
-    return _agent("coordinator", model, COORDINATOR_PLAN, [submit_plan], emit, usage, 2)
+    # load_memory is ADK's built-in memory tool: it searches the Runner's MemoryService (memory as tool use).
+    return _agent("coordinator", model, COORDINATOR_PLAN, [load_memory, submit_plan], emit, usage, 3)
 
 
 def reporter(model: BaseLlm, emit: Emit, usage: Usage, sub: Submission, known_ids: set[str],
