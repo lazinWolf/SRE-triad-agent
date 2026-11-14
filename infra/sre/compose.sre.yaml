@@ -40,7 +40,14 @@ services:
   currency: *cpu-baseline
   email: *cpu-baseline
   frontend: *cpu-baseline
-  payment: *cpu-baseline
+  # Upstream caps payment (Node.js with auto-instrumentation) at 140M. It then lives at 85-90% of the limit and
+  # the kernel reclaims its memory all the time: 0.4 CPU of kernel time at idle, requests stalling for seconds.
+  payment:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 300M
   product-catalog:
     deploy:
       resources:
@@ -52,3 +59,10 @@ services:
   quote: *cpu-baseline
   recommendation: *cpu-baseline
   shipping: *cpu-baseline
+
+  # Prometheus: our copy of the upstream config (adds rule_files + 15s evaluation) and the SRE
+  # recording/alerting rules. The config mount replaces upstream's (same container path).
+  prometheus:
+    volumes:
+      - ../sre/prometheus/prometheus-config.yaml:/etc/prometheus/prometheus-config.yaml
+      - ../sre/prometheus/rules.yml:/etc/prometheus/rules.yml

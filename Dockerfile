@@ -7,6 +7,9 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-install-project --no-dev
 COPY src ./src
 COPY seeds ./seeds
+COPY runbooks ./runbooks
+COPY infra/sre/standard.json ./infra/sre/standard.json
+COPY tests/data ./tests/data
 RUN uv sync --locked --no-dev
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8501

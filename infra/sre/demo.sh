@@ -21,6 +21,7 @@ case "${1:-}" in
     # The collector's docker_stats receiver can miss containers that start while it
     # initialises; restarting it once everything runs gives complete container metrics.
     docker restart otel-collector >/dev/null
+    "$0" standard
     port="${SRE_SHOP_PORT:-8090}"
     echo "Demo running: shop http://localhost:$port  Jaeger http://localhost:16686/jaeger/ui  Grafana http://localhost:$port/grafana"
     ;;
@@ -29,5 +30,10 @@ case "${1:-}" in
   ps)    compose ps --format 'table {{.Name}}\t{{.Status}}' ;;
   logs)  shift; compose logs --tail 100 "$@" ;;
   config) compose config ;;
-  *) echo "usage: $0 {up|pull|down|ps|logs [service]|config}" >&2; exit 2 ;;
+  standard)
+    # standard.json: compose-defined CPU/memory limits of the app containers + the pristine flagd document
+    compose config --format json | python3 "$here/standard.py" "$demo" "$here/standard.json"
+    echo "Wrote $here/standard.json"
+    ;;
+  *) echo "usage: $0 {up|pull|down|ps|logs [service]|config|standard}" >&2; exit 2 ;;
 esac

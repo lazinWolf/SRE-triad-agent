@@ -21,7 +21,7 @@ from google.genai import types
 
 from .config import PROJECT_ROOT
 
-APP = "sre_triage"   # must match the Runner's app and user, so load_memory searches the same scope
+APP = "sre_triage"   
 USER = "operator"
 RECORD = "record: "
 
@@ -39,11 +39,11 @@ def incident_text(r: dict[str, Any]) -> str:
 
 
 class Memory:
-    def __init__(self, data_dir: Path):
-        self.path = data_dir / "memory.sqlite"
+    def __init__(self, data_dir: Path, path: Path | None = None):
+        self.path = path or data_dir / "memory.sqlite"
         self.service = SqliteMemoryService(self.path)
 
-    # ------------------------------------------------------------------ async API (used by the workflow)
+    # async API 
     async def add(self, record: dict[str, Any], author: str = "triage") -> None:
         event = Event(id="incident", author=author, timestamp=record.get("created") or time.time(),
                       content=types.Content(role="model", parts=[
@@ -79,9 +79,6 @@ class Memory:
             except sqlite3.OperationalError:  # not created yet
                 return []
         return [r for r in (_record(types.Content.model_validate_json(row[0])) for row in rows) if r]
-
-    def remember(self, record: dict[str, Any]) -> None:
-        asyncio.run(self.add({**record, "created": time.time()}))
 
     def rate(self, incident_id: str, correct: bool, note: str = "") -> bool:
         record = next((r for r in self.all() if r["id"] == incident_id), None)

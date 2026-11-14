@@ -13,6 +13,7 @@ from typing import Any
 
 from google.adk.plugins.base_plugin import BasePlugin
 
+from . import tracing
 from .cases import Cases
 
 
@@ -21,11 +22,45 @@ def _short(value: Any, limit: int = 160) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """List price of a model call from LiteLLM's price table (what a free-tier call would cost when paid)."""
+    try:
+        import litellm
+
+        prompt, completion = litellm.cost_per_token(model=model, prompt_tokens=prompt_tokens,
+                                                    completion_tokens=completion_tokens)
+        return prompt + completion
+    except Exception:  # model not in the price table
+        return 0.0
+
+
 @dataclass
 class Usage:
     calls: int = 0
-    tokens: int = 0
-    models: dict[str, int] = field(default_factory=dict)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+    models: dict[str, int] = field(default_factory=dict)   # model -> calls it served
+    agents: dict[str, dict] = field(default_factory=dict)  # agent -> {calls, tokens}
+
+    def add_remote(self, agent: str, used: dict | None, asked: Any = None, answer: Any = None) -> None:
+        """Count (and trace) the LLM usage a remote agent reported for its own work (the CrewAI review board)."""
+        if not used:
+            return
+        calls, sent, got = (int(used.get(k) or 0) for k in ("llm_requests", "prompt_tokens", "completion_tokens"))
+        cost = cost_usd(used.get("model") or "", sent, got)
+        self.calls += calls
+        self.prompt_tokens += sent
+        self.completion_tokens += got
+        self.cost += cost
+        tracing.remote_call(agent, used.get("model") or "", sent, got, cost, asked, answer)
+        self.agents[agent] = {"calls": self.agents.get(agent, {}).get("calls", 0) + calls,
+                              "tokens": self.agents.get(agent, {}).get("tokens", 0) + sent + got}
+
+    def as_stats(self) -> dict:
+        return {"llm_calls": self.calls, "tokens": self.prompt_tokens + self.completion_tokens,
+                "prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens,
+                "cost_usd": round(self.cost, 5), "models_used": self.models, "agents": self.agents}
 
 
 class ActivityLog(BasePlugin):
@@ -45,11 +80,20 @@ class ActivityLog(BasePlugin):
 
     async def after_model_callback(self, *, callback_context, llm_response):
         usage = self.usage.setdefault(callback_context.session.id, Usage())
+        meta = llm_response.usage_metadata
+        sent, got = (meta.prompt_token_count or 0, meta.candidates_token_count or 0) if meta else (0, 0)
+        served = (llm_response.custom_metadata or {}).get("served_by")
         usage.calls += 1
-        if meta := llm_response.usage_metadata:
-            usage.tokens += (meta.prompt_token_count or 0) + (meta.candidates_token_count or 0)
-        if served := (llm_response.custom_metadata or {}).get("served_by"):
+        usage.prompt_tokens += sent
+        usage.completion_tokens += got
+        if served:
+            cost = cost_usd(served, sent, got)
             usage.models[served] = usage.models.get(served, 0) + 1
+            usage.cost += cost
+            tracing.model_call(served, cost)
+        per_agent = usage.agents.setdefault(callback_context.agent_name, {"calls": 0, "tokens": 0})
+        per_agent["calls"] += 1
+        per_agent["tokens"] += sent + got
         for part in (llm_response.content.parts if llm_response.content else None) or []:
             if part.text and part.text.strip():
                 self._emit(callback_context, "thought", callback_context.agent_name, part.text.strip())
@@ -57,6 +101,8 @@ class ActivityLog(BasePlugin):
     async def after_tool_callback(self, *, tool, tool_args, tool_context, result):
         if hasattr(result, "memories"):  # ADK load_memory
             result = {"result": f"{len(result.memories)} memories"}
+        if isinstance(result, dict) and "content" in result and not tool.name.startswith("submit_"):
+            return  # an MCP tool: the agent's own callback checks it, stores the evidence and logs it
         result = result if isinstance(result, dict) else {"result": result}
         if tool.name.startswith("submit_"):  # the answer's Pydantic / guardrail validation outcome
             text = f"{tool.name}: {result.get('status')}" + (f" ({'; '.join(result['errors'])})"

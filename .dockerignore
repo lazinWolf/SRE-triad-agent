@@ -1,0 +1,9 @@
+.git
+.venv
+.env
+data
+.legacy
+infra/otel-demo
+**/__pycache__
+.pytest_cache
+.claude

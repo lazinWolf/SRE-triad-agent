@@ -23,6 +23,8 @@ DEPENDENCIES = {
     "product-catalog": ["astronomy-db"],
     "shipping": ["quote"],
 }
+STORES = ("valkey-cart", "astronomy-db")  # data stores: no server spans; seen through their callers' client spans
+STORE_CLIENTS = {"valkey-cart": ("cart", "valkey-cart:6379"), "astronomy-db": ("product-catalog", "astronomy-db")}
 BASELINE_CPUS = 1.0  # every app container runs with 1 CPU (infra/sre/compose.sre.yaml)
 
 
@@ -38,9 +40,18 @@ class Settings(BaseModel):
     data_dir: Path = PROJECT_ROOT / "data"
     baseline_seconds: float = 300     # healthy reference window just before the incident
     agent_steps: int = 5              # tool calls per specialist before it must report
-    max_revisions: int = 1            # critic -> re-investigate loops
+    max_rounds: int = 3               # investigation rounds the coordinator may dispatch
+    max_revisions: int = 1            # review -> re-investigate loops
     verify_wait_seconds: float = 75   # settle time before checking recovery
-    critic_a2a_url: str = ""          # e.g. http://127.0.0.1:8001 to use the Critic A2A service
+    memory: bool = True               # recall and store past incidents
+    memory_file: Path | None = None   # default: <data_dir>/memory.sqlite (evaluation uses its own file)
+    reviewer_a2a_url: str = ""        # e.g. http://127.0.0.1:8002: the CrewAI review board (services/crew_reviewer)
+    mcp_url: str = ""                 # e.g. http://127.0.0.1:8011: MCP tool servers (`sre-triage mcp`); empty = embedded
+    screen_with_llm: bool = True      # second-stage LLM check of operator input (after the heuristics)
+
+    @property
+    def standard_file(self) -> Path:
+        return PROJECT_ROOT / "infra" / "sre" / "standard.json"
 
     @property
     def flagd_file(self) -> Path:
@@ -58,9 +69,13 @@ def get_settings() -> Settings:
                        ("jaeger_url", "SRE_JAEGER_URL"), ("opensearch_url", "SRE_OPENSEARCH_URL"),
                        ("docker_socket", "SRE_DOCKER_SOCKET"), ("demo_dir", "SRE_DEMO_DIR"),
                        ("data_dir", "SRE_DATA_DIR"), ("verify_wait_seconds", "SRE_VERIFY_WAIT_SECONDS"),
-                       ("critic_a2a_url", "SRE_CRITIC_A2A_URL")):
+                       ("reviewer_a2a_url", "SRE_REVIEWER_A2A_URL"), ("mcp_url", "SRE_MCP_URL"),
+                       ("max_rounds", "SRE_MAX_ROUNDS")):
         if env.get(var):
             values[field] = env[var]
+    for field, var in (("memory", "SRE_MEMORY"), ("screen_with_llm", "SRE_SCREEN_WITH_LLM")):
+        if env.get(var):
+            values[field] = env[var].lower() not in ("0", "off", "false", "no")
     if env.get("SRE_FALLBACK_MODELS"):
         values["fallback_models"] = [m.strip() for m in env["SRE_FALLBACK_MODELS"].split(",") if m.strip()]
     settings = Settings(**values)

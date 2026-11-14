@@ -3,7 +3,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
-data/
+/data/
 infra/otel-demo/
 dist/
 *.egg-info/
+.vscode/
+.playwright-mcp/
+.legacy/

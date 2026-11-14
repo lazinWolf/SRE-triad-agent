@@ -26,6 +26,10 @@ MEMORY_USAGE = "container_memory_usage_total_bytes"
 MEMORY_LIMIT = "container_memory_usage_limit_bytes"
 
 
+# recorded baseline series (see infra/sre/prometheus/rules.yml): result key -> sre:service_<name>:baseline
+BASELINE_SERIES = {"requests_per_s": "requests", "error_ratio": "error_ratio", "p50_ms": "p50_ms", "p95_ms": "p95_ms"}
+
+
 class Unavailable(RuntimeError):
     """A backend could not answer."""
 
@@ -53,8 +57,11 @@ class Prometheus:
 
     def service_red(self, service: str, start: float, end: float) -> dict[str, float | None]:
         """Request rate, error ratio and latency of a service's server spans over [start, end]."""
+        return self.red(f'service_name="{service}",span_kind="SPAN_KIND_SERVER"', start, end)
+
+    def red(self, sel: str, start: float, end: float) -> dict[str, float | None]:
+        """Rate, error ratio and latency of the spans matching a label selector over [start, end]."""
         w = f"{max(30, int(end - start))}s"
-        sel = f'service_name="{service}",span_kind="SPAN_KIND_SERVER"'
         exprs = {
             "requests_per_s": f"sum(rate({SPAN_CALLS}{{{sel}}}[{w}]))",
             "error_ratio": f'(sum(rate({SPAN_CALLS}{{{sel},status_code="STATUS_CODE_ERROR"}}[{w}])) or vector(0))'
@@ -63,6 +70,42 @@ class Prometheus:
             "p95_ms": f"histogram_quantile(0.95, sum by (le) (rate({SPAN_BUCKET}{{{sel}}}[{w}])))",
         }
         return {k: _round(self.query(e, end)) for k, e in exprs.items()}
+
+    def service_baseline(self, service: str, at: float) -> dict[str, float | None] | None:
+        """Healthy reference for a service at time `at`: the median of the last six hours, learned only from
+        alert-free periods (recording rules in infra/sre/prometheus/rules.yml). None if the rules are not loaded."""
+        sel = f'{{service_name="{service}"}}'
+        out = {key: _round(self.query(f"sre:service_{name}:baseline{sel}", at)) for key, name in BASELINE_SERIES.items()}
+        return out if any(v is not None for v in out.values()) else None
+
+    def alerts(self) -> list[dict[str, Any]]:
+        """Pending and firing alerts of the SRE rule group."""
+        try:
+            r = httpx.get(f"{self.url}/api/v1/alerts", timeout=10)
+            r.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise Unavailable(f"Prometheus: {exc}") from exc
+        rows = []
+        for a in r.json()["data"]["alerts"]:
+            labels, notes = a.get("labels") or {}, a.get("annotations") or {}
+            if not labels.get("kind"):  # not one of ours
+                continue
+            rows.append({"name": labels.get("alertname"), "service": labels.get("service"), "kind": labels["kind"],
+                         "severity": labels.get("severity", "warning"), "state": a.get("state"),
+                         "since": _epoch(a.get("activeAt")), "summary": notes.get("summary", ""),
+                         "value": _num(a.get("value"))})
+        return sorted(rows, key=lambda a: (a["state"] != "firing", a["since"] or 0))
+
+    def series(self, expr: str, start: float, end: float, step: float = 15) -> list[tuple[float, float]]:
+        """Range query: (time, value) points of the first series."""
+        try:
+            r = httpx.get(f"{self.url}/api/v1/query_range", timeout=15,
+                          params={"query": expr, "start": start, "end": end, "step": max(5, int(step))})
+            r.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise Unavailable(f"Prometheus: {exc}") from exc
+        result = r.json()["data"]["result"]
+        return [(float(t), v) for t, raw in (result[0]["values"] if result else []) if (v := _num(raw)) is not None]
 
     def container(self, name: str, start: float, end: float) -> dict[str, float | None]:
         w = f"{max(30, int(end - start))}s"
@@ -74,6 +117,20 @@ class Prometheus:
             "memory_limit_mb": f"max(last_over_time({MEMORY_LIMIT}{{{sel}}}[{w}])) / 1048576",
         }
         return {k: _round(self.query(e, end)) for k, e in exprs.items()}
+
+
+def _epoch(stamp: str | None) -> float | None:
+    """RFC 3339 timestamp (as Prometheus prints it) -> unix seconds."""
+    if not stamp:
+        return None
+    from datetime import datetime
+
+    head, _, frac = stamp.replace("Z", "+00:00").partition(".")
+    zone = frac[max(frac.find("+"), frac.find("-")):] if frac and ("+" in frac or "-" in frac) else ("" if frac else "")
+    try:
+        return datetime.fromisoformat(head + (zone if frac else "")).timestamp()
+    except ValueError:
+        return None
 
 
 def _round(value: float | None) -> float | None:
@@ -103,6 +160,15 @@ class Jaeger:
         if errors:
             params["tags"] = json.dumps({"error": "true"})
         return self._get("/api/traces", params).get("data") or []
+
+    def get(self, trace_id: str) -> dict | None:
+        data = self._get(f"/api/traces/{quote(trace_id)}").get("data") or []
+        return data[0] if data else None
+
+    def dependencies(self, end: float, lookback_seconds: float) -> list[dict]:
+        """Observed service-to-service calls: [{parent, child, callCount}]."""
+        return self._get("/api/dependencies", {"endTs": int(end * 1000),
+                                               "lookback": int(lookback_seconds * 1000)}).get("data") or []
 
 
 def _tags(items: list[dict] | None) -> dict[str, Any]:
@@ -195,7 +261,7 @@ class Logs:
 
 
 class Docker:
-    """Docker Engine API over the unix socket: inspect, events, CPU updates and restarts."""
+    """Docker Engine API over the unix socket: inspect, events, logs, resource updates and lifecycle."""
 
     def __init__(self, socket: str):
         self.socket = socket
@@ -216,13 +282,15 @@ class Docker:
         return {"cpu_limit": round((host.get("NanoCpus") or 0) / 1e9, 3) or None,
                 "memory_limit_mb": round(host["Memory"] / 2**20) if host.get("Memory") else None,
                 "status": state.get("Status"), "restart_count": attrs.get("RestartCount", 0),
-                "oom_killed": state.get("OOMKilled", False), "started_at": state.get("StartedAt")}
+                "oom_killed": state.get("OOMKilled", False), "exit_code": state.get("ExitCode"),
+                "started_at": state.get("StartedAt")}
 
     def events(self, since: float, until: float, names: list[str] | None = None) -> list[dict[str, Any]]:
         until = min(until, time.time() - 1)
         if until <= since:
             return []
-        filters = json.dumps({"type": ["container"], "event": ["update", "restart", "die", "oom", "start"]})
+        filters = json.dumps({"type": ["container"], "event": ["update", "restart", "die", "oom", "start", "stop",
+                                                               "kill", "pause", "unpause"]})
         r = self._request("GET", "/events", params={"since": int(since), "until": int(until), "filters": filters})
         rows = []
         for line in r.text.splitlines():
@@ -235,8 +303,38 @@ class Docker:
     def set_cpus(self, name: str, cpus: float) -> None:
         self._request("POST", f"/containers/{quote(name)}/update", json={"NanoCpus": int(cpus * 1e9)})
 
+    def set_memory(self, name: str, mb: float) -> None:
+        size = int(mb * 2**20)
+        self._request("POST", f"/containers/{quote(name)}/update", json={"Memory": size, "MemorySwap": size})
+
     def restart(self, name: str) -> None:
         self._request("POST", f"/containers/{quote(name)}/restart", params={"t": 10}, timeout=90)
+
+    def stop(self, name: str) -> None:
+        self._request("POST", f"/containers/{quote(name)}/stop", params={"t": 5}, timeout=60)
+
+    def start(self, name: str) -> None:
+        self._request("POST", f"/containers/{quote(name)}/start", timeout=60)
+
+    def pause(self, name: str) -> None:
+        self._request("POST", f"/containers/{quote(name)}/pause")
+
+    def unpause(self, name: str) -> None:
+        self._request("POST", f"/containers/{quote(name)}/unpause")
+
+    def logs(self, name: str, since: float, until: float, tail: int = 40) -> list[str]:
+        """Last stdout/stderr lines of a container in a time range."""
+        r = self._request("GET", f"/containers/{quote(name)}/logs", params={
+            "stdout": 1, "stderr": 1, "since": int(since), "until": int(until) + 1, "tail": tail, "timestamps": 0})
+        raw, lines, i = r.content, [], 0
+        if raw[:1] in (b"\x00", b"\x01", b"\x02") and len(raw) >= 8:  # multiplexed stream: 8-byte frame headers
+            while i + 8 <= len(raw):
+                size = int.from_bytes(raw[i + 4:i + 8], "big")
+                lines += raw[i + 8:i + 8 + size].decode("utf-8", "replace").splitlines()
+                i += 8 + size
+        else:
+            lines = raw.decode("utf-8", "replace").splitlines()
+        return [" ".join(line.split())[:300] for line in lines if line.strip()][-tail:]
 
 
 def read_flags(path: Path) -> dict[str, dict[str, Any]]:
@@ -258,8 +356,30 @@ def write_flag(path: Path, flag: str, variant: str) -> str:
     return previous
 
 
+def write_flag_entry(path: Path, flag: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Replace a flag's whole definition (default variant and targeting); returns the previous one."""
+    data = json.loads(path.read_text())
+    if flag not in data["flags"]:
+        raise ValueError(f"unknown flag: {flag}")
+    previous, data["flags"][flag] = data["flags"][flag], entry
+    with open(path, "r+") as handle:
+        handle.write(json.dumps(data, indent=2) + "\n")
+        handle.truncate()
+    return previous
+
+
+def load_standard(path: Path) -> dict[str, Any]:
+    """The healthy configuration of the demo: {"services": {name: {"cpus", "memory_mb"}}, "flags": <flagd document>}.
+    Written by `infra/sre/demo.sh standard` from the compose files and the pristine flag file."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {"services": {}, "flags": {"flags": {}}}
+
+
 class Backends:
     def __init__(self, settings: Settings):
+        self.standard = load_standard(settings.standard_file)
         self.prometheus = Prometheus(settings.prometheus_url)
         self.jaeger = Jaeger(settings.jaeger_url)
         self.logs = Logs(settings.opensearch_url)

@@ -1,23 +1,47 @@
-# Runs the triage dashboard in a container next to the OpenTelemetry Demo.
+# The triage app next to the OpenTelemetry Demo: dashboard, MCP tool servers and the CrewAI review board.
 # Start the demo first:   infra/sre/demo.sh up
 # Then:                   docker compose up --build -d     ->  http://localhost:8501
+# The same file is the cloud deployment: one VM (e.g. GCP Compute Engine) runs the demo and these containers.
+x-triage: &triage
+  build: .
+  env_file: .env
+  environment: &triage-env
+    SRE_PROMETHEUS_URL: http://prometheus:9090
+    SRE_JAEGER_URL: http://jaeger:16686/jaeger/ui
+    SRE_OPENSEARCH_URL: http://opensearch:9200
+    SRE_DEMO_DIR: /demo
+    SRE_DATA_DIR: /data
+  volumes:
+    - ./data:/data
+    - /var/run/docker.sock:/var/run/docker.sock
+    # flagd watches this directory; remediation and fault injection edit its flag file.
+    - ./infra/otel-demo/src/flagd:/demo/src/flagd
+  networks: [opentelemetry-demo]
+  restart: unless-stopped
+
 services:
   triage-ui:
-    build: .
+    <<: *triage
+    environment:
+      <<: *triage-env
+      SRE_MCP_URL: http://triage-mcp:8011
+      SRE_REVIEWER_A2A_URL: http://127.0.0.1:8002
+    ports: ["127.0.0.1:8501:8501"]
+    depends_on: [triage-mcp]
+
+  # The investigation tools as two MCP servers: telemetry on 8011, ops on 8012.
+  triage-mcp:
+    <<: *triage
+    command: ["sre-triage", "mcp", "--host", "0.0.0.0", "--port", "8011"]
+
+  # CrewAI review board over A2A. It shares the dashboard's network namespace, so the ADK side reaches its
+  # agent card on loopback (ADK requires HTTPS for agent cards on any other host).
+  crew-reviewer:
+    build: services/crew_reviewer
     env_file: .env
     environment:
-      SRE_PROMETHEUS_URL: http://prometheus:9090
-      SRE_JAEGER_URL: http://jaeger:16686/jaeger/ui
-      SRE_OPENSEARCH_URL: http://opensearch:9200
-      SRE_DEMO_DIR: /demo
-      SRE_DATA_DIR: /data
-    volumes:
-      - ./data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
-      # flagd watches this directory; remediation and fault injection edit its flag file.
-      - ./infra/otel-demo/src/flagd:/demo/src/flagd
-    ports: ["127.0.0.1:8501:8501"]
-    networks: [opentelemetry-demo]
+      CREW_REVIEWER_URL: http://127.0.0.1:8002/
+    network_mode: "service:triage-ui"
     restart: unless-stopped
 
 networks:

@@ -6,20 +6,26 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-Category = Literal["cpu_limit", "cpu_saturation", "memory_exhaustion", "dependency_errors",
-                   "dependency_unavailable", "lock_contention", "cache_failure", "config_change", "unknown"]
+Category = Literal["cpu_limit", "cpu_saturation", "memory_limit", "memory_exhaustion", "dependency_errors",
+                   "dependency_unavailable", "service_down", "lock_contention", "cache_failure", "traffic_spike",
+                   "config_change", "unknown"]
 CATEGORY_HELP = {
     "cpu_limit": "container CPU limit too low: CPU throttling, usage pinned at the limit",
     "cpu_saturation": "process burns CPU (busy loop/load) with a normal limit",
-    "memory_exhaustion": "memory growth, OOM kills or restarts",
+    "memory_limit": "container memory limit too low: OOM kills and restarts right after start",
+    "memory_exhaustion": "memory grows (leak) until OOM kills or restarts",
     "dependency_errors": "a service returns errors to its callers (failed operations)",
-    "dependency_unavailable": "a service cannot be reached at all (connection refused/timeouts)",
+    "dependency_unavailable": "a running service cannot be reached (bad address, connection refused, timeouts)",
+    "service_down": "a container is stopped, crashed or paused: its traffic drops to zero",
     "lock_contention": "requests serialise on a lock: latency up, CPU not saturated",
-    "cache_failure": "cache misses/evictions make a service slow",
+    "cache_failure": "cache misses/evictions or a broken cache make a service slow",
+    "traffic_spike": "request rate far above normal overloads the system",
     "config_change": "a feature flag or setting changed behaviour (when no category above fits)",
     "unknown": "not determined",
 }
-AgentName = Literal["metrics", "traces", "logs_changes"]
+AgentName = Literal["metrics", "traces", "logs_changes", "infra"]
+Action = Literal["set_cpu_limit", "set_memory_limit", "set_feature_flag", "restart_service", "start_service",
+                 "unpause_service"]
 
 
 def _confidence(value):
@@ -45,16 +51,26 @@ class Task(BaseModel):
 
 
 class Plan(BaseModel):
+    """One investigation round the coordinator dispatches."""
+
     hypotheses: list[str] = Field(description="2-4 competing explanations to test")
     tasks: list[Task] = Field(min_length=1, max_length=3)
 
 
+class Question(BaseModel):
+    """A question the coordinator asks the human operator."""
+
+    question: str = Field(min_length=8)
+
+
 class Remediation(BaseModel):
-    action: Literal["set_cpu_limit", "set_feature_flag", "restart_service"]
+    action: Action
     service: str | None = None
     cpus: float | None = None
+    memory_mb: float | None = None
     flag: str | None = None
     variant: str | None = None
+    restart_after: bool = Field(False, description="also restart `service` after turning the flag off")
 
 
 class Hypothesis(BaseModel):
@@ -64,7 +80,7 @@ class Hypothesis(BaseModel):
 
 
 class Report(BaseModel):
-    status: Literal["diagnosed", "inconclusive"]
+    status: Literal["diagnosed", "inconclusive", "no_incident"]
     summary: str
     root_cause_service: str | None = None
     category: Category = "unknown"
@@ -73,6 +89,7 @@ class Report(BaseModel):
     evidence_ids: list[str] = []
     hypotheses: list[Hypothesis] = []
     remediation: Remediation | None = None
+    alternative: Remediation | None = Field(None, description="a second option the operator may choose instead")
 
     _conf = field_validator("confidence", mode="before")(_confidence)
 
@@ -81,10 +98,5 @@ class Critique(BaseModel):
     verdict: Literal["accept", "revise"]
     issues: list[str] = []
     follow_up: list[Task] = Field([], max_length=2)
-
-
-def schema_hint(model: type[BaseModel]) -> str:
-    """Compact JSON schema for prompts."""
-    import json
-
-    return json.dumps(model.model_json_schema(), separators=(",", ":"))
+    risk: Literal["low", "medium", "high"] = "low"   # of the proposed remediation
+    risk_notes: str = ""

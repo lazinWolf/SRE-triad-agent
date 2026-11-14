@@ -24,22 +24,41 @@ class World:
     def __init__(self, flagd_file: Path, faulty: bool = True):
         self.flagd_file = flagd_file
         self.cpu = {"cart": 0.02 if faulty else 1.0}
+        self.memory: dict[str, float] = {}
+        self.status: dict[str, str] = {}
         self.restarts: list[str] = []
+        self.logs: dict[str, list[str]] = {}
+        self.stubborn = False   # True: the shop stays slow whatever is done (a wrong diagnosis)
 
     @property
     def broken(self) -> bool:
-        return self.cpu.get("cart", 1.0) < 0.5
+        return self.stubborn or self.cpu.get("cart", 1.0) < 0.5
+
+
+HEALTHY = {"requests_per_s": 5.0, "error_ratio": 0.0, "p50_ms": 10.0, "p95_ms": 50.0}
 
 
 class FakePrometheus:
     def __init__(self, world: World):
         self.world = world
+        self.firing: list[dict] = []
 
     def service_red(self, service, start, end):
         baseline = abs((end - start) - 300) < 1
         slow = self.world.broken and not baseline and service in ("checkout", "cart", "frontend")
-        return {"requests_per_s": 5.0, "error_ratio": 0.0, "p50_ms": 30.0 if slow else 10.0,
-                "p95_ms": 400.0 if slow else 50.0}
+        return {**HEALTHY, "p50_ms": 30.0 if slow else 10.0, "p95_ms": 400.0 if slow else 50.0}
+
+    def service_baseline(self, service, at):
+        return dict(HEALTHY)
+
+    def red(self, sel, start, end):
+        return dict(HEALTHY)
+
+    def alerts(self):
+        return self.firing if self.world.broken else []  # alerts exist only while the fault is in place
+
+    def series(self, expr, start, end, step=15):
+        return [(start, 50.0), (end, 400.0 if self.world.broken else 50.0)]
 
     def container(self, name, start, end):
         throttled = self.world.broken and name == "cart" and abs((end - start) - 300) >= 1
@@ -50,6 +69,12 @@ class FakePrometheus:
 class FakeJaeger:
     def search(self, service, start, end, **kw):
         return []
+
+    def get(self, trace_id):
+        return None
+
+    def dependencies(self, end, lookback_seconds):
+        return [{"parent": "frontend", "child": "checkout", "callCount": 10}]
 
 
 class FakeLogs:
@@ -62,22 +87,46 @@ class FakeDocker:
         self.world = world
 
     def inspect(self, name):
-        return {"cpu_limit": self.world.cpu.get(name, 1.0), "memory_limit_mb": None, "status": "running",
-                "restart_count": 0, "oom_killed": False, "started_at": ""}
+        return {"cpu_limit": self.world.cpu.get(name, 1.0), "memory_limit_mb": self.world.memory.get(name, 160),
+                "status": self.world.status.get(name, "running"), "restart_count": 0, "oom_killed": False,
+                "exit_code": 0, "started_at": ""}
 
     def events(self, since, until, names=None):
         return [{"time": since + 290, "container": "cart", "action": "update"}] if self.world.broken else []
 
+    def logs(self, name, since, until, tail=40):
+        return self.world.logs.get(name, [])
+
     def set_cpus(self, name, cpus):
         self.world.cpu[name] = cpus
 
+    def set_memory(self, name, mb):
+        self.world.memory[name] = mb
+
     def restart(self, name):
         self.world.restarts.append(name)
+        self.world.status[name] = "running"
+
+    def start(self, name):
+        self.world.status[name] = "running"
+
+    def stop(self, name):
+        self.world.status[name] = "exited"
+
+    def pause(self, name):
+        self.world.status[name] = "paused"
+
+    def unpause(self, name):
+        self.world.status[name] = "running"
 
 
 def fake_backends(world: World):
+    from sre_triage.config import SERVICES, STORES
+
+    standard = {"services": {name: {"cpus": 1.0, "memory_mb": 160} for name in SERVICES + STORES},
+                "flags": json.loads(world.flagd_file.read_text())}
     return SimpleNamespace(prometheus=FakePrometheus(world), jaeger=FakeJaeger(), logs=FakeLogs(),
-                           docker=FakeDocker(world), flagd_file=world.flagd_file)
+                           docker=FakeDocker(world), flagd_file=world.flagd_file, standard=standard)
 
 
 def write_flags(path: Path) -> Path:
@@ -88,7 +137,7 @@ def write_flags(path: Path) -> Path:
 
 
 def settings_for(tmp_path: Path) -> Settings:
-    return Settings(data_dir=tmp_path, verify_wait_seconds=0, agent_steps=3)
+    return Settings(data_dir=tmp_path, verify_wait_seconds=0, agent_steps=3, screen_with_llm=False)
 
 
 # ---------------------------------------------------------------------------- scripted model
@@ -100,13 +149,21 @@ def call(name: str, **args) -> list[types.Part]:
 
 
 def role_of(request: LlmRequest) -> str:
+    """Which script answers. The coordinator's turn is split by what it is asked to do: "plan" on its first turn,
+    "replan" when it is sent back (review, operator feedback, failed fix) and may still investigate, else "report"."""
     system = str(request.config.system_instruction or "") if request.config else ""
-    for marker, role in (("Coordinator of a team", "plan"), ("Combine the specialists", "report"),
-                         ("You are the Critic", "critic"), ("Metrics specialist", "metrics"),
-                         ("Traces specialist", "traces"), ("Logs & Changes", "logs_changes")):
+    if "incident Coordinator" in system:
+        text = user_text(request)
+        if "Investigation rounds used: 0." in text:
+            return "plan"
+        sent_back = any(m in text for m in ("sent your report back", "REJECTED", "did NOT recover"))
+        return "replan" if sent_back and "No more rounds" not in text else "report"
+    for marker, role in (("You are the Critic", "critic"), ("Metrics specialist", "metrics"),
+                         ("Traces specialist", "traces"), ("Logs & Changes", "logs_changes"),
+                         ("Infrastructure specialist", "infra"), ("single SRE agent", "solo")):
         if marker in system:
             return role
-    return "solo"
+    return "other"
 
 
 def responses(request: LlmRequest) -> list[dict]:
@@ -119,7 +176,7 @@ def user_text(request: LlmRequest) -> str:
 
 
 def cited(request: LlmRequest) -> list[str]:
-    return sorted(set(re.findall(r"\b[MTLS]\d+\b", user_text(request))))
+    return sorted(set(re.findall(r"\b[MTLSI]\d+\b", user_text(request))))
 
 
 class ScriptedModel(BaseLlm):
@@ -182,6 +239,11 @@ DEFAULTS: dict[str, Script] = {
                                 "category": "cpu_limit", "confidence": 0.8}),
     "solo": specialist("container_resources", {"service": "cart"},
                        {"summary": "cart throttled", "suspect_service": "cart", "category": "cpu_limit", "confidence": 0.7}),
+    "infra": specialist("container_status", {"service": "cart"},
+                        {"summary": "cart is running", "suspect_service": "", "category": "unknown", "confidence": 0.3}),
+    "replan": submit("submit_plan", {"hypotheses": ["cart CPU limit", "something else"],
+                                     "tasks": [{"agent": "traces", "question": "Where does checkout time go?"}]}),
     "report": submit("submit_report", good_report),
+    "other": lambda request: [types.Part(text="{}")],
     "critic": submit("submit_review", {"verdict": "accept", "issues": [], "follow_up": []}),
 }

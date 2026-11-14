@@ -9,8 +9,9 @@ description = "Multi-agent SRE incident triage for the OpenTelemetry Demo (Googl
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "google-adk[a2a,db]>=2.12.0",
+    "google-adk[a2a,db,mcp]>=2.12.0",
     "httpx>=0.28.1",
+    "langfuse>=4.15.6",
     "litellm>=1.104.2",
     "pydantic>=2.14.0",
     "python-dotenv>=1.2.4",
@@ -31,3 +32,4 @@ packages = ["src/sre_triage"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning:google.adk", "ignore::UserWarning:google.adk"]

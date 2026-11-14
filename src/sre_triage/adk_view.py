@@ -9,7 +9,7 @@ from typing import Any
 from .schemas import Critique, Finding, Plan, Report
 
 SCHEMAS = {"Plan (coordinator → submit_plan)": Plan, "Finding (specialists → submit_finding)": Finding,
-           "Report (coordinator → submit_report)": Report, "Critique (critic → submit_review / A2A)": Critique}
+           "Report (coordinator → submit_report)": Report, "Critique (review board → submit_review / A2A)": Critique}
 
 
 def _path(event) -> str:
@@ -93,6 +93,6 @@ def validations(events: list) -> list[dict[str, Any]]:
 
 
 def a2a_events(events: list) -> list[dict[str, Any]]:
-    """Messages exchanged with the remote (A2A) critic."""
+    """Messages exchanged with the remote (A2A) CrewAI review board."""
     return [{"time": e.timestamp, "text": _text(" ".join(p.text for p in e.content.parts if p.text), 500)}
-            for e in events if e.author == "remote_critic" and e.content and any(p.text for p in e.content.parts or [])]
+            for e in events if e.author == "crew_reviewer" and e.content and any(p.text for p in e.content.parts or [])]

@@ -1,0 +1,218 @@
+# SRE triage rules: RED recording rules, "healthy" baselines learned only from alert-free
+# periods, and alerts. The series/alert names and labels are a contract with src/sre_triage.
+#
+# One group, evaluated top to bottom every 15s: Prometheus runs the rules of a group
+# sequentially and commits each rule's samples before the next one is evaluated, so the order
+# below is the data flow
+#     rate1m series -> incident_active -> healthy -> baseline -> alerts
+# The cycle (alerts -> incident_active) is broken by time: incident_active reads the ALERTS of
+# the previous evaluation. An incident is gated out from the moment an alert fires until 10
+# minutes after the last one cleared; the minute before it fires slips through (a handful of
+# samples out of ~1400 per 6h window) and the median ignores it.
+# Bootstrap: sre:incident_active is 0 when nothing fires and the shop is whole, baselines fall back
+# to the plain series until healthy samples exist, so everything exists after the first cycles.
+groups:
+  - name: sre
+    interval: 15s
+    rules:
+      # ---- RED per service (SERVER spans only) ------------------------------------------------
+      - record: sre:service_requests:rate1m
+        expr: sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[1m]))
+
+      # errors / requests; 0 when there are requests but no error series (NaN when idle is dropped)
+      - record: sre:service_error_ratio:rate1m
+        expr: |
+          (
+            sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER", status_code="STATUS_CODE_ERROR"}[1m]))
+            or
+            sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[1m])) * 0
+          )
+          / sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[1m]))
+          >= 0
+
+      # histogram_quantile is NaN when the window holds no request; ">= 0" drops those samples
+      - record: sre:service_p50_ms:rate1m
+        expr: |
+          histogram_quantile(0.5, sum by (service_name, le) (rate(traces_span_metrics_duration_milliseconds_bucket{span_kind="SPAN_KIND_SERVER"}[1m]))) >= 0
+
+      - record: sre:service_p95_ms:rate1m
+        expr: |
+          histogram_quantile(0.95, sum by (service_name, le) (rate(traces_span_metrics_duration_milliseconds_bucket{span_kind="SPAN_KIND_SERVER"}[1m]))) >= 0
+
+      # ---- incident gate ----------------------------------------------------------------------
+      # 1 while any alert of this group (they all carry `kind`) is firing, or while the shop is not
+      # whole: one of its 15 containers (apps, data stores, proxy, load generator) has had no docker stats for a
+      # minute. After a reboot only some containers come back by themselves; the proxy then answers a few
+      # requests in 2 ms, which must not be learned as "healthy".
+      - record: sre:incident_raw
+        expr: |
+          clamp_max(
+            (count(ALERTS{kind!="", alertstate="firing"}) or vector(0))
+            + ((count(count by (container_name) (last_over_time(container_memory_usage_total_bytes{container_name=~"ad|cart|checkout|currency|email|frontend|frontend-proxy|load-generator|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[1m]))) or vector(0)) < bool 15),
+            1)
+
+      # Pending alerts do not count: on this low-traffic shop they flicker for 15-30 s without ever firing, and
+      # the first minute of a real incident is 4 samples out of ~1400, which the median ignores.
+      # ... and for 10 minutes after that ended (recovery and warm-up are not healthy either). Always exists.
+      - record: sre:incident_active
+        expr: max_over_time(sre:incident_raw[10m]) or vector(0)
+
+      # ---- healthy variants: samples only while no incident is active ---------------------------
+      - record: sre:service_requests:healthy
+        expr: sre:service_requests:rate1m and on() (sre:incident_active == 0)
+      - record: sre:service_error_ratio:healthy
+        expr: sre:service_error_ratio:rate1m and on() (sre:incident_active == 0)
+      - record: sre:service_p50_ms:healthy
+        expr: sre:service_p50_ms:rate1m and on() (sre:incident_active == 0)
+      - record: sre:service_p95_ms:healthy
+        expr: sre:service_p95_ms:rate1m and on() (sre:incident_active == 0)
+
+      # ---- baselines: 6h median of the healthy series, else of the plain series ------------------
+      - record: sre:service_requests:baseline
+        expr: |
+          quantile_over_time(0.5, sre:service_requests:healthy[6h])
+          or quantile_over_time(0.5, sre:service_requests:rate1m[6h])
+      - record: sre:service_error_ratio:baseline
+        expr: |
+          quantile_over_time(0.5, sre:service_error_ratio:healthy[6h])
+          or quantile_over_time(0.5, sre:service_error_ratio:rate1m[6h])
+      - record: sre:service_p50_ms:baseline
+        expr: |
+          quantile_over_time(0.5, sre:service_p50_ms:healthy[6h])
+          or quantile_over_time(0.5, sre:service_p50_ms:rate1m[6h])
+      - record: sre:service_p95_ms:baseline
+        expr: |
+          quantile_over_time(0.5, sre:service_p95_ms:healthy[6h])
+          or quantile_over_time(0.5, sre:service_p95_ms:rate1m[6h])
+
+      # ---- service alerts ---------------------------------------------------------------------
+      # Latency more than 1.5x the baseline AND more than 50 ms above it. Busy services (baseline >= 0.5
+      # requests/s) are judged on the p95. Quiet ones are judged on the median: with a few requests a minute
+      # the 1-minute p95 is the single slowest request, and on a healthy shop checkout jumps 100 -> 350 ms for
+      # over a minute. `quantile` says which one fired; tools.compare_red applies the same rule.
+      - alert: ServiceHighLatency
+        expr: |
+          label_replace(
+            sre:service_p95_ms:rate1m > on(service_name) (sre:service_p95_ms:baseline * 1.5)
+            and on(service_name) (sre:service_p95_ms:rate1m > on(service_name) (sre:service_p95_ms:baseline + 50))
+            and on(service_name) (sre:service_requests:baseline >= 0.5)
+            and on(service_name) (sre:service_requests:rate1m > 0.05),
+            "quantile", "p95", "", "")
+          or
+          label_replace(
+            sre:service_p50_ms:rate1m > on(service_name) (sre:service_p50_ms:baseline * 1.5)
+            and on(service_name) (sre:service_p50_ms:rate1m > on(service_name) (sre:service_p50_ms:baseline + 50))
+            and on(service_name) (sre:service_requests:baseline < 0.5)
+            and on(service_name) (sre:service_requests:rate1m > 0.05),
+            "quantile", "p50", "", "")
+        for: 1m
+        labels:
+          kind: latency
+          severity: warning
+          service: "{{ $labels.service_name }}"
+        annotations:
+          summary: |-
+            {{ $labels.service_name }} {{ $labels.quantile }} latency {{ $value | printf "%.0f" }} ms vs {{ with printf "sre:service_%s_ms:baseline{service_name='%s'}" $labels.quantile $labels.service_name | query }}{{ . | first | value | printf "%.0f" }}{{ end }} ms baseline
+
+      # error ratio more than 2 points above baseline, at least ~1.5 failed requests per minute
+      - alert: ServiceHighErrorRate
+        expr: |
+          sre:service_error_ratio:rate1m > on(service_name) (sre:service_error_ratio:baseline + 0.02)
+          and on(service_name) (sre:service_error_ratio:rate1m * sre:service_requests:rate1m * 60 >= 1.5)
+        for: 1m
+        labels:
+          kind: errors
+          severity: '{{ if gt $value 0.2 }}critical{{ else }}warning{{ end }}'
+          service: "{{ $labels.service_name }}"
+        annotations:
+          summary: |-
+            {{ $labels.service_name }} error ratio {{ $value | humanizePercentage }} vs {{ with printf "sre:service_error_ratio:baseline{service_name='%s'}" $labels.service_name | query }}{{ . | first | value | humanizePercentage }}{{ end }} baseline
+
+      # baseline traffic is meaningful but the service now serves < 20% of it for a minute; the
+      # service may have vanished from the span metrics altogether.
+      - alert: ServiceTrafficDrop
+        expr: |
+          sre:service_requests:baseline > 0.05
+          unless on(service_name) (max_over_time(sre:service_requests:rate1m[1m]) >= 0.2 * sre:service_requests:baseline)
+        for: 1m
+        labels:
+          kind: traffic_drop
+          severity: critical
+          service: "{{ $labels.service_name }}"
+        annotations:
+          summary: |-
+            {{ $labels.service_name }} traffic dropped to {{ with printf "sre:service_requests:rate1m{service_name='%s'}" $labels.service_name | query }}{{ . | first | value | printf "%.2f" }}{{ else }}0{{ end }} req/s vs {{ $value | printf "%.2f" }} req/s baseline
+
+      - alert: ServiceTrafficSpike
+        expr: |
+          sre:service_requests:rate1m > 3 * sre:service_requests:baseline
+          and sre:service_requests:baseline > 0.05
+          and sre:service_requests:rate1m > 1
+        for: 1m
+        labels:
+          kind: traffic_spike
+          severity: warning
+          service: "{{ $labels.service_name }}"
+        annotations:
+          summary: |-
+            {{ $labels.service_name }} request rate {{ $value | printf "%.1f" }} req/s is more than 3x its baseline
+
+      # ---- container alerts (application and datastore containers) -----------------------------
+      # Seen in docker_stats during the last hour but silent for the last minute: stopped.
+      - alert: ContainerDown
+        expr: |
+          count by (container_name) (last_over_time(container_memory_usage_total_bytes{container_name=~"ad|cart|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[1h]))
+          unless
+          count by (container_name) (last_over_time(container_memory_usage_total_bytes{container_name=~"ad|cart|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[1m]))
+        for: 1m
+        labels:
+          kind: container_down
+          severity: critical
+          service: "{{ $labels.container_name }}"
+        annotations:
+          summary: "container {{ $labels.container_name }} is not running (no docker stats for over a minute)"
+
+      - alert: ContainerRestarted
+        expr: increase(container_restarts_total{container_name=~"ad|cart|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[5m]) > 0
+        for: 0m
+        labels:
+          kind: restarts
+          severity: warning
+          service: "{{ $labels.container_name }}"
+        annotations:
+          summary: "container {{ $labels.container_name }} restarted {{ $value | printf \"%.0f\" }} time(s) in the last 5 minutes (crash or OOM kill)"
+
+      # Throttled CFS periods / all periods over 2 minutes > 20%, and the container loses at least 8% of wall
+      # time to throttling. The second condition separates a real limit problem from payment, which is healthy
+      # yet throttled in 15-25% of periods (1-5% of wall time, more while the host is busy); a lightly loaded
+      # container with a 0.02 CPU limit (cart) shows ~25% and ~10%.
+      - alert: ContainerCpuThrottled
+        expr: |
+          (
+            increase(container_cpu_throttling_data_throttled_periods_total{container_name=~"ad|cart|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[2m])
+            / increase(container_cpu_throttling_data_periods_total{container_name=~"ad|cart|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[2m])
+          ) > 0.2
+          and (rate(container_cpu_throttling_data_throttled_time_nanoseconds_total{container_name=~"ad|cart|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[2m]) / 1e9 > 0.08)
+          and increase(container_cpu_throttling_data_throttled_periods_total{container_name=~"ad|cart|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}[2m]) >= 20
+        for: 1m
+        labels:
+          kind: cpu_throttled
+          severity: warning
+          service: "{{ $labels.container_name }}"
+        annotations:
+          summary: "container {{ $labels.container_name }} CPU throttled in {{ $value | humanizePercentage }} of scheduling periods"
+
+      # containers without a limit report 0 or the host total and never get near 95%
+      # cart is left out: its .NET runtime normally fills ~97% of the limit before it collects garbage
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          container_memory_usage_total_bytes{container_name=~"ad|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"}
+          / (container_memory_usage_limit_bytes{container_name=~"ad|checkout|currency|email|frontend|payment|product-catalog|quote|recommendation|shipping|valkey-cart|astronomy-db"} > 0)
+          > 0.95
+        for: 1m
+        labels:
+          kind: memory
+          severity: warning
+          service: "{{ $labels.container_name }}"
+        annotations:
+          summary: "container {{ $labels.container_name }} memory at {{ $value | humanizePercentage }} of its limit"

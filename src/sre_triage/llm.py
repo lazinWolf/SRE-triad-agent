@@ -17,13 +17,17 @@ from typing import Any
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
-from google.adk.models import BaseLlm  # noqa: E402
-from google.adk.models.lite_llm import LiteLlm  # noqa: E402
-from google.adk.models.llm_request import LlmRequest  # noqa: E402
-from google.adk.models.llm_response import LlmResponse  # noqa: E402
-from pydantic import PrivateAttr  # noqa: E402
+from google.adk.models import BaseLlm  
+from google.adk.models.lite_llm import LiteLlm 
+from google.adk.models.llm_request import LlmRequest  
+from google.adk.models.llm_response import LlmResponse  
+from pydantic import PrivateAttr 
 
-from .config import Settings  # noqa: E402
+from .config import Settings 
+
+import litellm  # noqa: E402
+
+litellm.suppress_debug_info = True  # no "Provider List" banner for models missing from the price table
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +72,7 @@ class FallbackLlm(BaseLlm):
         self._models = []
         for name in models:
             kwargs: dict[str, Any] = {"timeout": 60, "num_retries": 0}
-            if not name.startswith("gemini/gemini-3"):  # Gemini 3 deprecates sampling parameters
+            if "gemini" not in name:  # Gemini 3+ deprecates sampling parameters
                 kwargs["temperature"] = settings.temperature
             self._models.append(LiteLlm(model=name, **kwargs))
 
