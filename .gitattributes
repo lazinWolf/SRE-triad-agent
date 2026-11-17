@@ -1,0 +1,5 @@
+# Left out of `git archive`, the copy that goes to the VM (see README, deployment): development-only files.
+/.claude export-ignore
+/synopses export-ignore
+/final-req.md export-ignore
+/.gitattributes export-ignore

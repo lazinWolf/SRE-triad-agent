@@ -231,6 +231,37 @@ def test_fallback_skips_a_model_that_sends_an_invalid_tool_call(monkeypatch):
     assert response.custom_metadata["served_by"] == "groq/good"
 
 
+def test_claude_models_are_called_without_a_temperature(monkeypatch):
+    from google.adk.models.lite_llm import LiteLlm
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    from sre_triage.config import Settings
+    from sre_triage.llm import FallbackLlm
+
+    seen = {}
+
+    async def fake(self, request, stream=False):
+        seen[self.model] = request.config.temperature
+        if "claude" in self.model:
+            raise RuntimeError("503 overloaded")
+        yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="ok")]))
+
+    monkeypatch.setattr(LiteLlm, "generate_content_async", fake)
+    llm = FallbackLlm(["vertex_ai/claude-haiku-5-5", "groq/good"], Settings())
+    claude, groq = llm._models
+    assert "temperature" not in claude._additional_args and groq._additional_args["temperature"] == 0.1
+    request = LlmRequest(contents=[types.Content(role="user", parts=[types.Part(text="hi")])],
+                         config=types.GenerateContentConfig(temperature=0))   # what the guardrail classifier sends
+
+    async def run():
+        return [r async for r in llm.generate_content_async(request)]
+
+    asyncio.run(run())
+    assert seen == {"vertex_ai/claude-haiku-5-5": None, "groq/good": 0}
+
+
 def test_tracing_is_off_without_keys(monkeypatch):
     from sre_triage import tracing
 

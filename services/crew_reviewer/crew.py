@@ -55,7 +55,9 @@ def build_crew(text: str, model: str | None = None) -> Crew:
     model = model or models()[0]
     # A hung provider must not block the review: the caller falls back to the next model, then to the local critic.
     limits = {"timeout": 60, "max_retries": 0}
-    llm = LLM(model=model, **limits) if model.startswith("gemini/") else LLM(model=model, temperature=0.1, **limits)
+    # Gemini 3+ deprecates sampling parameters and current Claude models reject them (also behind vertex_ai/...)
+    fixed_sampling = "gemini" in model or "claude" in model
+    llm = LLM(model=model, **limits) if fixed_sampling else LLM(model=model, temperature=0.1, **limits)
 
     auditor = Agent(
         role="Evidence Auditor",

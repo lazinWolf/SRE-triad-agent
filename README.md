@@ -335,47 +335,91 @@ this low-traffic demo. They can still be investigated when an operator opens the
 
 Run it yourself with `uv run sre-triage eval --suite quick`. The report is `data/eval/<run>/report.md`.
 
-## Deployment on GCP (containers tested locally, cloud not done yet)
+## Deployment on GCP (prepared and tested in containers locally, cloud not done yet)
 
 `compose.yaml` runs the dashboard, the MCP servers and the CrewAI review board as three containers next to the
-demo. This was built and run on the development machine: `doctor` passes inside the dashboard container and a
-full fault scenario ran from it. The same steps on a VM are the cloud deployment. They have not been run on GCP.
+demo on one Compute Engine VM. Models come from Vertex AI through the VM's service account, so no key file goes to
+the VM. Checked on the development machine (17 Nov 2026): the images build, `doctor` passes inside the dashboard
+container (MCP over the Docker network, the review board over A2A, Langfuse), all dashboard pages load, and a full
+fault scenario ran from the container. Vertex AI answered for `gemini-3.5-flash-lite` and `gemini-3.1-flash-lite` in
+project `sre-triad-agent` (location `global`); `gemini-3.5-flash` answered 429 there.
+
+What goes to the VM: `git archive` of the last commit. `.gitattributes` leaves out `.claude/`, `synopses/` and
+`final-req.md`; untracked files (`.env`, `data/`, `.venv/`, the demo checkout) are never in it. The images get
+only what their Dockerfiles copy (allowlists in `.dockerignore` and `services/crew_reviewer/.dockerignore`).
 
 ```bash
-# 1. VM: 4 vCPU, 16 GB, 60 GB disk. No firewall rule is needed, the dashboard is reached through SSH.
+# 0. From your machine, once: project, APIs, and the Vertex AI role for the VM's service account
+gcloud config set project sre-triad-agent
+gcloud services enable compute.googleapis.com aiplatform.googleapis.com
+SA=$(gcloud iam service-accounts list --filter="email~compute@developer" --format="value(email)")
+gcloud projects add-iam-policy-binding sre-triad-agent --member="serviceAccount:$SA" --role=roles/aiplatform.user
+
+# 1. VM: 4 vCPU, 16 GB, 60 GB disk. No firewall rule is needed: everything is reached through SSH.
 gcloud compute instances create sre-triage --zone=europe-west1-b --machine-type=e2-standard-4 \
   --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud --boot-disk-size=60GB \
-  --scopes=cloud-platform
+  --service-account="$SA" --scopes=cloud-platform
+
+# 2. Copy the code and your .env (then edit .env on the VM, see the Vertex lines below)
+git archive --format=tar.gz -o /tmp/sre-triage.tgz HEAD
+gcloud compute scp /tmp/sre-triage.tgz .env sre-triage:~ --zone=europe-west1-b
 gcloud compute ssh sre-triage --zone=europe-west1-b
 
-# 2. On the VM: Docker, the code, the keys
+# 3. On the VM: Docker, unpack, the shop with its observability stack (about 25 containers, minutes on first start)
 curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER && newgrp docker
-git clone https://github.com/lazinWolf/SRE-triad-agent.git sre-triage && cd sre-triage
-cp .env.example .env && nano .env            # model keys, LANGFUSE_* keys
-
-# 3. The shop with its observability stack (about 25 containers, several minutes on the first start)
+mkdir sre-triage && tar -xzf sre-triage.tgz -C sre-triage && mv .env sre-triage/ && cd sre-triage
+nano .env                                    # SRE_MODEL / VERTEXAI_* lines below
 infra/sre/demo.sh up
 
-# 4. The triage app
+# 4. The triage app, then the health check (it fetches a Vertex token without calling a model)
 docker compose up --build -d
 docker compose exec triage-ui sre-triage doctor
 
-# 5. From your own machine: open the dashboard through an SSH tunnel, then http://localhost:8501
-gcloud compute ssh sre-triage --zone=europe-west1-b -- -L 8501:localhost:8501
+# 5. From your machine: the tunnel, then open http://localhost:8501
+gcloud compute ssh sre-triage --zone=europe-west1-b -- -N -L 8501:localhost:8501 -L 8090:localhost:8090 -L 9090:localhost:9090
 ```
 
-- Do not open port 8501 to the internet. The dashboard has no login and the app can change containers through
-  the Docker socket. `compose.yaml` binds it to `127.0.0.1` for this reason.
+`.env` on the VM for Vertex AI (keep the `LANGFUSE_*` keys; the AI Studio key is an optional last fallback):
+
+```bash
+SRE_MODEL=vertex_ai/gemini-3.5-flash-lite
+SRE_FALLBACK_MODELS=vertex_ai/gemini-3.1-flash-lite,gemini/gemini-3.5-flash-lite
+VERTEXAI_PROJECT=sre-triad-agent
+VERTEXAI_LOCATION=global
+```
+
+What the tunnel opens (the dashboard sidebar links to all of them):
+
+| URL | What |
+|---|---|
+| http://localhost:8501 | the triage dashboard |
+| http://localhost:8090/grafana/ | Grafana with the demo's dashboards |
+| http://localhost:8090/jaeger/ui/ | Jaeger traces of the shop |
+| http://localhost:9090 | Prometheus: the alert rules and the recording rules the agents query |
+| http://localhost:8090/feature/ | flagd feature flags |
+| http://localhost:8090/ | the shop |
+| Langfuse Cloud (`LANGFUSE_BASE_URL`) | agent traces, cost and scores; no tunnel needed |
+
+- Do not open ports to the internet. The dashboard has no login and the app can change containers through the
+  Docker socket. `compose.yaml` binds the dashboard to `127.0.0.1`. The demo publishes some ports on all
+  interfaces (Prometheus, Grafana, its databases); on GCP only the VPC firewall keeps them private, so add no
+  `0.0.0.0/0` rule. To show the dashboard to someone else, give them the tunnel command and IAP/SSH access.
+- Traces from the containers are tagged `LANGFUSE_TRACING_ENVIRONMENT=production` (set it in `.env` to
+  change), so in Langfuse they can be told apart from local test runs.
+- Cost: every model call is priced from LiteLLM's table and shown per case, per agent and in Langfuse. The quick
+  suite on Flash Lite cost about $0.01 to $0.04 per incident. There is no dollar cap in the app, so set a budget
+  alert on the billing account (Billing → Budgets & alerts).
 - The MCP servers are only reachable inside the Docker network. The reviewer shares the dashboard's network
   namespace, so ADK reaches its agent card on loopback.
-- After a VM restart run `infra/sre/demo.sh up` again. Most demo containers do not restart by themselves.
-- Stop the VM when it is not used (`gcloud compute instances stop sre-triage --zone=europe-west1-b`).
-- Wait about ten minutes after the first start before running a case. The alert rules need a healthy baseline.
-- Models from Google Cloud (Vertex AI) instead of the free AI Studio keys: give the VM's service account the
-  Vertex AI User role and set `SRE_MODEL=vertex_ai/gemini-3.5-flash`, `VERTEXAI_PROJECT` and
-  `VERTEXAI_LOCATION` in `.env`. No key file is needed on the VM (`--scopes=cloud-platform` above lets the
-  containers use the VM's identity). LiteLLM supports this, but it has not been tried in this project yet.
-- To look at the shop itself, add `-L 8090:localhost:8090` to the tunnel command.
+- After a VM restart run `infra/sre/demo.sh up` again (most demo containers do not restart by themselves); the
+  three app containers restart by themselves. Wait about ten minutes before running a case: the alert rules
+  need a healthy baseline.
+- Stop the VM when it is not used (`gcloud compute instances stop sre-triage --zone=europe-west1-b`). The zone is
+  only a suggestion; `asia-south1-a` is closer to India and makes the tunnel faster.
+- Claude through Vertex AI: `SRE_MODEL=vertex_ai/claude-haiku-5-5` with `VERTEXAI_LOCATION=global`. Enable the
+  model in the Model Garden first. A new project has no request quota for Claude models (the API answers 429
+  "Quota exceeded ... anthropic-claude-haiku"), so ask for a quota increase under IAM & Admin → Quotas. The code
+  leaves out the temperature setting for Claude models, which they reject. Not run end to end.
 - Why not Cloud Run: the app needs the Docker socket, the flagd flag file and the demo's containers next to it.
 
 ## Tests
@@ -431,5 +475,5 @@ data/             Cases, sessions, memory, evaluation output (not committed)
   latency noisy and can raise alerts on a healthy shop.
 - After a reboot only some demo containers come back. Run `infra/sre/demo.sh up` again. The baseline ignores
   the time the shop was not whole.
-- The cloud deployment has not been done yet.
+- The cloud deployment has not been done yet (prepared: see Deployment on GCP).
 - The agents can only change what the six allowlisted actions allow, and only on the demo's containers.

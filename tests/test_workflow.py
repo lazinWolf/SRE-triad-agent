@@ -136,6 +136,16 @@ def test_operator_can_choose_the_alternative_action(tmp_path, world):
     assert world.restarts == ["cart"] and state["chosen"]["action"] == "restart_service"
 
 
+def test_an_alternative_equal_to_the_fix_is_offered_once(tmp_path, world):
+    def report(request):
+        return {**good_report(request), "alternative_action": {"action": "set_cpu_limit", "service": "cart", "cpus": 1.0}}
+
+    t = make(tmp_path, world, ScriptedModel({"report": submit("submit_report", report)}))
+    case = t.open_case("Checkout latency is elevated")
+    t.run(case)
+    assert len(t.pending(case)["options"]) == 1
+
+
 def test_invalid_submissions_are_returned_to_the_model(tmp_path, world):
     attempts = []
 

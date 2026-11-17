@@ -11,6 +11,8 @@ x-triage: &triage
     SRE_OPENSEARCH_URL: http://opensearch:9200
     SRE_DEMO_DIR: /demo
     SRE_DATA_DIR: /data
+    # Langfuse keeps the deployed app's traces apart from test runs (filter by environment in the UI)
+    LANGFUSE_TRACING_ENVIRONMENT: ${LANGFUSE_TRACING_ENVIRONMENT:-production}
   volumes:
     - ./data:/data
     - /var/run/docker.sock:/var/run/docker.sock

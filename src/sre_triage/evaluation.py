@@ -231,7 +231,8 @@ def load_runs(data_dir: Path) -> list[dict]:
     root = Path(data_dir) / "eval"
     out = []
     for path in sorted(root.iterdir(), reverse=True) if root.is_dir() else []:
-        results = _read_results(path / "results.jsonl")
+        # rows written by earlier versions of the project have no "variant" and cannot be summarized
+        results = [r for r in _read_results(path / "results.jsonl") if "variant" in r]
         if not results:
             continue
         try:

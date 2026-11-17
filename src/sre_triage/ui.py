@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import sys
 import threading
@@ -134,7 +135,19 @@ def sidebar() -> tuple[str, str]:
     mode = st.sidebar.radio("Mode", ["multi", "single"], format_func=lambda m: {
         "multi": "Multi-agent (coordinator + specialists + review board)", "single": "Single agent (baseline)"}[m])
     st.sidebar.caption("Inject faults on the Fault lab page (operator only, agents never see it).")
+    observability_links()
     return model, mode
+
+
+def observability_links() -> None:
+    """Browser links. On the VM they work through the SSH tunnel, which forwards the same local ports."""
+    shop = f"http://localhost:{os.getenv('SRE_SHOP_PORT', '8090')}"
+    links = [f"[Grafana]({shop}/grafana/)", f"[Jaeger]({shop}/jaeger/ui/)", "[Prometheus](http://localhost:9090)",
+             f"[Feature flags]({shop}/feature/)", f"[Shop]({shop}/)"]
+    if tracing.enabled():
+        links.insert(0, f"[Langfuse]({os.getenv('LANGFUSE_BASE_URL', 'https://cloud.langfuse.com')})")
+    st.sidebar.subheader("Observability")
+    st.sidebar.markdown(" · ".join(links))
 
 
 # ---------------------------------------------------------------------------- incidents
@@ -501,7 +514,7 @@ def fmt(key: str, value) -> str:
         return str(int(value))
     if "cost" in key:
         return f"${value:.4f}"
-    if key.endswith("_s_mean") or key.endswith("_s"):
+    if key.endswith(("_s_mean", "_s_median", "_s")):
         return f"{value:.1f} s"
     return f"{value:.1f}" if key.endswith("_mean") else f"{value:.0%}"
 

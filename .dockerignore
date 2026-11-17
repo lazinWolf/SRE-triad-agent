@@ -1,9 +1,12 @@
-.git
-.venv
-.env
-data
-.legacy
-infra/otel-demo
+# Allowlist: the image gets only what the Dockerfile copies. Everything else (.env, .claude, .git, data,
+# .venv, tests, synopses, the demo checkout, editor and browser-test folders) stays out of the build context.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!seeds/
+!runbooks/
+!infra/sre/standard.json
+!tests/data/
 **/__pycache__
-.pytest_cache
-.claude

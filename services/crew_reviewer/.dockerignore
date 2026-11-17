@@ -1,0 +1,6 @@
+# Allowlist: only what the Dockerfile copies (keeps the local .venv out of the build context).
+*
+!pyproject.toml
+!uv.lock
+!crew.py
+!server.py

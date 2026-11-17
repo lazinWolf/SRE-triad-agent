@@ -240,6 +240,8 @@ def test_load_runs_returns_the_contract_shape_newest_first(tmp_path):
         if config is not None:
             (root / name / "suite.json").write_text(json.dumps(config))
     (root / "20260103-empty").mkdir()
+    (root / "eval_old").mkdir()   # a run from an earlier version of the project: other fields, no "variant"
+    (root / "eval_old" / "results.jsonl").write_text(json.dumps({"scenario": "cart_cpu_limit", "mode": "multi_agent"}))
     runs = load_runs(tmp_path)
     assert [r["id"] for r in runs] == ["20260102-100000-full", "20260101-100000-quick"]
     assert set(runs[0]) == {"id", "path", "config", "results", "summary"}

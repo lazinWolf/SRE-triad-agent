@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -347,7 +348,23 @@ def doctor(settings, backends: Backends) -> int:
           + ("keys set" if tracing.enabled() else "LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set"))
     chain = [settings.model] + settings.fallback_models
     check("model keys", lambda: ", ".join(f"{m}{'' if has_key(m) else ' (NO KEY)'}" for m in chain))
+    if any(m.startswith("vertex_ai/") for m in chain):
+        check("Vertex AI credentials", vertex_credentials)
     return 0 if ok else 1
+
+
+def vertex_credentials() -> str:
+    """Fetch a Google token the way LiteLLM will (the VM's service account, or a gcloud ADC login). No model is called."""
+    import google.auth
+    from google.auth.transport.requests import Request
+
+    creds, adc_project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    creds.refresh(Request())
+    project = os.getenv("VERTEXAI_PROJECT") or adc_project
+    if not project:
+        raise Unavailable("set VERTEXAI_PROJECT in .env")
+    location = os.getenv("VERTEXAI_LOCATION") or "us-central1 (LiteLLM's default; Gemini 3.5 needs global)"
+    return f"token ok ({type(creds).__module__.split('.')[-1]}), project {project}, location {location}"
 
 
 if __name__ == "__main__":

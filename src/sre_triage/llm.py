@@ -36,8 +36,12 @@ PROVIDER_KEYS = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY", "openrouter
 SUGGESTED_MODELS = [
     "gemini/gemini-3.5-flash", "gemini/gemini-flash-latest", "gemini/gemini-3.5-flash-lite",
     "gemini/gemini-3.1-flash-lite", "groq/openai/gpt-oss-120b", "groq/qwen/qwen3.8-27b",
-    "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
 ]
+
+
+def takes_temperature(model: str) -> bool:
+    """False for Claude models: the current ones answer 400 to any temperature other than the default."""
+    return "claude" not in model
 
 
 def has_key(model: str) -> bool:
@@ -72,7 +76,7 @@ class FallbackLlm(BaseLlm):
         self._models = []
         for name in models:
             kwargs: dict[str, Any] = {"timeout": 60, "num_retries": 0}
-            if "gemini" not in name:  # Gemini 3+ deprecates sampling parameters
+            if "gemini" not in name and takes_temperature(name):  # Gemini 3+ deprecates sampling parameters
                 kwargs["temperature"] = settings.temperature
             self._models.append(LiteLlm(model=name, **kwargs))
 
@@ -90,6 +94,8 @@ class FallbackLlm(BaseLlm):
                         continue
                 request = llm_request.model_copy(deep=True)
                 request.model = inner.model
+                if request.config and not takes_temperature(inner.model):  # e.g. the guardrail classifier asks for 0
+                    request.config.temperature = None
                 if inner.model.startswith("groq/"):  # Groq rejects reasoning text in the history
                     for content in request.contents:
                         content.parts = [p for p in content.parts or [] if not p.thought or p.function_call] or content.parts

@@ -330,6 +330,8 @@ class Triage:
         report = ctx.state["report"]
         proposals = [p for p in (report.get("remediation"), report.get("alternative")) if p] \
             if report["status"] == "diagnosed" else []
+        if len(proposals) == 2 and proposals[0] == proposals[1]:   # the model repeated its fix as the alternative
+            proposals = proposals[:1]
         if not proposals or not report.get("remediation"):
             ctx.route = "skip"
             ctx.state["decision"] = {"approved": False, "reason": "no action proposed"}
