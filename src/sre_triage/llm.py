@@ -34,14 +34,15 @@ log = logging.getLogger(__name__)
 PROVIDER_KEYS = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY", "openrouter": "OPENROUTER_API_KEY",
                  "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
 SUGGESTED_MODELS = [
-    "gemini/gemini-3.5-flash", "gemini/gemini-flash-latest", "gemini/gemini-3.5-flash-lite",
+    "gemini/gemini-3.5-flash-lite", "vertex_ai/gemini-3.5-flash-lite", "vertex_ai/gemini-3.1-flash-lite",
+    "gemini/gemini-3.5-flash", "gemini/gemini-flash-latest",
     "gemini/gemini-3.1-flash-lite", "groq/openai/gpt-oss-120b", "groq/qwen/qwen3.8-27b",
 ]
 
 
 def takes_temperature(model: str) -> bool:
-    """False for Claude models: the current ones answer 400 to any temperature other than the default."""
-    return "claude" not in model
+    """False for Claude models (they answer 400 to any non-default temperature) and Gemini (3+ deprecates it)."""
+    return "claude" not in model and "gemini" not in model
 
 
 def has_key(model: str) -> bool:
@@ -76,7 +77,7 @@ class FallbackLlm(BaseLlm):
         self._models = []
         for name in models:
             kwargs: dict[str, Any] = {"timeout": 60, "num_retries": 0}
-            if "gemini" not in name and takes_temperature(name):  # Gemini 3+ deprecates sampling parameters
+            if takes_temperature(name):
                 kwargs["temperature"] = settings.temperature
             self._models.append(LiteLlm(model=name, **kwargs))
 

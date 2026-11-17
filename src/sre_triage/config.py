@@ -29,7 +29,7 @@ BASELINE_CPUS = 1.0  # every app container runs with 1 CPU (infra/sre/compose.sr
 
 
 class Settings(BaseModel):
-    model: str = "gemini/gemini-3.5-flash"
+    model: str = "gemini/gemini-3.5-flash-lite"
     fallback_models: list[str] = []
     temperature: float = 0.1
     prometheus_url: str = "http://127.0.0.1:9090"

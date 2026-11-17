@@ -341,34 +341,39 @@ Run it yourself with `uv run sre-triage eval --suite quick`. The report is `data
 demo on one Compute Engine VM. Models come from Vertex AI through the VM's service account, so no key file goes to
 the VM. Checked on the development machine (17 Nov 2026): the images build, `doctor` passes inside the dashboard
 container (MCP over the Docker network, the review board over A2A, Langfuse), all dashboard pages load, and a full
-fault scenario ran from the container. Vertex AI answered for `gemini-3.5-flash-lite` and `gemini-3.1-flash-lite` in
-project `sre-triad-agent` (location `global`); `gemini-3.5-flash` answered 429 there.
+fault scenario ran from the container. Vertex AI answered for `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` and
+`gemini-3.5-flash` in project `sre-triad-agent` (location `global`). Vertex serves Gemini from shared capacity, so
+a busy moment answers 429 (`gemini-3.5-flash` did once); the fallback chain then uses the next model.
+A full fault case ran on `vertex_ai/gemini-3.5-flash-lite` for every agent and the CrewAI review board
+(`payment_memory_limit`, multi-agent): correct diagnosis, fix applied, recovered, 21 model calls, $0.019, 198 s.
 
 What goes to the VM: `git archive` of the last commit. `.gitattributes` leaves out `.claude/`, `synopses/` and
 `final-req.md`; untracked files (`.env`, `data/`, `.venv/`, the demo checkout) are never in it. The images get
 only what their Dockerfiles copy (allowlists in `.dockerignore` and `services/crew_reviewer/.dockerignore`).
 
 ```bash
-# 0. From your machine, once: project, APIs, and the Vertex AI role for the VM's service account
+# 0. From your machine, once: project, APIs, and a service account that may only call Vertex AI
 gcloud config set project sre-triad-agent
 gcloud services enable compute.googleapis.com aiplatform.googleapis.com
-SA=$(gcloud iam service-accounts list --filter="email~compute@developer" --format="value(email)")
+gcloud iam service-accounts create sre-triage-vm --display-name="SRE triage VM"
+SA=sre-triage-vm@sre-triad-agent.iam.gserviceaccount.com
 gcloud projects add-iam-policy-binding sre-triad-agent --member="serviceAccount:$SA" --role=roles/aiplatform.user
 
-# 1. VM: 4 vCPU, 16 GB, 60 GB disk. No firewall rule is needed: everything is reached through SSH.
-gcloud compute instances create sre-triage --zone=europe-west1-b --machine-type=e2-standard-4 \
+# 1. VM: 4 vCPU, 16 GB, 60 GB disk. n2, because this project has no E2 CPU quota in asia-south1.
+#    No firewall rule is needed: everything is reached through SSH.
+gcloud compute instances create sre-triage --zone=asia-south1-b --machine-type=n2-standard-4 \
   --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud --boot-disk-size=60GB \
   --service-account="$SA" --scopes=cloud-platform
 
-# 2. Copy the code and your .env (then edit .env on the VM, see the Vertex lines below)
+# 2. Copy the code (last commit) and the VM's .env (local .env with the Vertex lines below)
 git archive --format=tar.gz -o /tmp/sre-triage.tgz HEAD
-gcloud compute scp /tmp/sre-triage.tgz .env sre-triage:~ --zone=europe-west1-b
-gcloud compute ssh sre-triage --zone=europe-west1-b
+gcloud compute scp /tmp/sre-triage.tgz sre-triage:~ --zone=asia-south1-b
+gcloud compute scp data/vm.env sre-triage:~/.env --zone=asia-south1-b
+gcloud compute ssh sre-triage --zone=asia-south1-b
 
 # 3. On the VM: Docker, unpack, the shop with its observability stack (about 25 containers, minutes on first start)
 curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER && newgrp docker
-mkdir sre-triage && tar -xzf sre-triage.tgz -C sre-triage && mv .env sre-triage/ && cd sre-triage
-nano .env                                    # SRE_MODEL / VERTEXAI_* lines below
+mkdir sre-triage && tar -xzf sre-triage.tgz -C sre-triage && mv .env sre-triage/ && chmod 600 sre-triage/.env && cd sre-triage
 infra/sre/demo.sh up
 
 # 4. The triage app, then the health check (it fetches a Vertex token without calling a model)
@@ -376,10 +381,10 @@ docker compose up --build -d
 docker compose exec triage-ui sre-triage doctor
 
 # 5. From your machine: the tunnel, then open http://localhost:8501
-gcloud compute ssh sre-triage --zone=europe-west1-b -- -N -L 8501:localhost:8501 -L 8090:localhost:8090 -L 9090:localhost:9090
+gcloud compute ssh sre-triage --zone=asia-south1-b -- -N -L 8501:localhost:8501 -L 8090:localhost:8090 -L 9090:localhost:9090
 ```
 
-`.env` on the VM for Vertex AI (keep the `LANGFUSE_*` keys; the AI Studio key is an optional last fallback):
+`.env` on the VM for Vertex AI (plus the `LANGFUSE_*` keys; the AI Studio key is an optional last fallback):
 
 ```bash
 SRE_MODEL=vertex_ai/gemini-3.5-flash-lite
@@ -414,8 +419,7 @@ What the tunnel opens (the dashboard sidebar links to all of them):
 - After a VM restart run `infra/sre/demo.sh up` again (most demo containers do not restart by themselves); the
   three app containers restart by themselves. Wait about ten minutes before running a case: the alert rules
   need a healthy baseline.
-- Stop the VM when it is not used (`gcloud compute instances stop sre-triage --zone=europe-west1-b`). The zone is
-  only a suggestion; `asia-south1-a` is closer to India and makes the tunnel faster.
+- Stop the VM when it is not used (`gcloud compute instances stop sre-triage --zone=asia-south1-b`).
 - Claude through Vertex AI: `SRE_MODEL=vertex_ai/claude-haiku-5-5` with `VERTEXAI_LOCATION=global`. Enable the
   model in the Model Garden first. A new project has no request quota for Claude models (the API answers 429
   "Quota exceeded ... anthropic-claude-haiku"), so ask for a quota increase under IAM & Admin → Quotas. The code

@@ -231,7 +231,7 @@ def test_fallback_skips_a_model_that_sends_an_invalid_tool_call(monkeypatch):
     assert response.custom_metadata["served_by"] == "groq/good"
 
 
-def test_claude_models_are_called_without_a_temperature(monkeypatch):
+def test_claude_and_gemini_models_are_called_without_a_temperature(monkeypatch):
     from google.adk.models.lite_llm import LiteLlm
     from google.adk.models.llm_request import LlmRequest
     from google.adk.models.llm_response import LlmResponse
@@ -244,14 +244,15 @@ def test_claude_models_are_called_without_a_temperature(monkeypatch):
 
     async def fake(self, request, stream=False):
         seen[self.model] = request.config.temperature
-        if "claude" in self.model:
+        if "groq" not in self.model:
             raise RuntimeError("503 overloaded")
         yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="ok")]))
 
     monkeypatch.setattr(LiteLlm, "generate_content_async", fake)
-    llm = FallbackLlm(["vertex_ai/claude-haiku-5-5", "groq/good"], Settings())
-    claude, groq = llm._models
-    assert "temperature" not in claude._additional_args and groq._additional_args["temperature"] == 0.1
+    llm = FallbackLlm(["vertex_ai/claude-haiku-5-5", "vertex_ai/gemini-3.5-flash-lite", "groq/good"], Settings())
+    claude, gemini, groq = llm._models
+    assert "temperature" not in claude._additional_args and "temperature" not in gemini._additional_args
+    assert groq._additional_args["temperature"] == 0.1
     request = LlmRequest(contents=[types.Content(role="user", parts=[types.Part(text="hi")])],
                          config=types.GenerateContentConfig(temperature=0))   # what the guardrail classifier sends
 
@@ -259,7 +260,7 @@ def test_claude_models_are_called_without_a_temperature(monkeypatch):
         return [r async for r in llm.generate_content_async(request)]
 
     asyncio.run(run())
-    assert seen == {"vertex_ai/claude-haiku-5-5": None, "groq/good": 0}
+    assert seen == {"vertex_ai/claude-haiku-5-5": None, "vertex_ai/gemini-3.5-flash-lite": None, "groq/good": 0}
 
 
 def test_tracing_is_off_without_keys(monkeypatch):

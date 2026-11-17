@@ -23,7 +23,7 @@ if not os.getenv("LANGFUSE_PUBLIC_KEY"):
 from crewai import LLM, Agent, Crew, Process, Task  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
-DEFAULT_MODEL = "gemini/gemini-3.5-flash"
+DEFAULT_MODEL = "gemini/gemini-3.5-flash-lite"
 MODEL_SECONDS, REVIEW_SECONDS = 100, 240  # longest wait for one model, and for the whole review
 PROVIDER_KEYS = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY", "openrouter": "OPENROUTER_API_KEY",
                  "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
